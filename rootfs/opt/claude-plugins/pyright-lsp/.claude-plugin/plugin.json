@@ -1,0 +1,10 @@
+{
+  "name": "pyright-lsp",
+  "version": "1.0.0",
+  "description": "Python language server (Pyright). Server definition copied from anthropics/claude-plugins-official.",
+  "author": {
+    "name": "paseo-workstation",
+    "url": "https://github.com/RealBeepMcJeep/paseo-workstation"
+  },
+  "license": "MIT"
+}

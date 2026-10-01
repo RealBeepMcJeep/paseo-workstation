@@ -1,0 +1,10 @@
+{
+  "name": "typescript-lsp",
+  "version": "1.0.0",
+  "description": "TypeScript/JavaScript language server. Server definition copied from anthropics/claude-plugins-official.",
+  "author": {
+    "name": "paseo-workstation",
+    "url": "https://github.com/RealBeepMcJeep/paseo-workstation"
+  },
+  "license": "MIT"
+}

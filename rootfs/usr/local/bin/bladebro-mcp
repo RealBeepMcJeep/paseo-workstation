@@ -1,0 +1,8 @@
+#!/bin/sh
+# bladebro MCP server for the agents, using the image's Chromium.
+# Sets its own environment because Codex starts MCP servers with a filtered
+# environment (only HOME, PATH, LANG, ... survive).
+export CHROME_PATH="${CHROME_PATH:-/usr/bin/chromium}"
+export BLADE_CHROME_FLAGS="${BLADE_CHROME_FLAGS:---no-sandbox}"
+export BLADE_NO_UPDATE_CHECK=1
+exec /usr/local/bin/bladebro mcp "$@"

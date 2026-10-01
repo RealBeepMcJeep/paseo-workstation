@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+"""Merge the workstation-owned entries into agent configs at container start.
+
+Owned entries, and nothing else, are rewritten on every start:
+  - mcphub MCP server (Claude, Codex, Pi): present only when MCPHUB_TOKEN is set.
+    Configs hold the literal ${MCPHUB_TOKEN} reference, never the token.
+  - bladebro MCP server (Claude, Codex): the image's bladebro-mcp wrapper.
+    Pi keeps its own bladebro extension.
+  - Codex sandbox_mode/approval_policy defaults (the container is the sandbox).
+
+Each section is independent and non-fatal: a failure leaves that file
+untouched, is recorded in workstation-status.json and the startup warnings
+file, and Paseo still starts. Credentials are never printed.
+"""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+import tomlkit
+
+HOME = Path(os.environ["HOME"])
+PASEO = Path(os.environ["PASEO_HOME"])
+CLAUDE = Path(os.environ["CLAUDE_CONFIG_DIR"])
+CODEX = Path(os.environ["CODEX_HOME"])
+WARNINGS = PASEO / "workstation-startup-warnings.txt"
+
+MCP_URL = os.environ.get("MCP_HOMELAB_URL", "")
+HAVE_MCPHUB = bool(MCP_URL and os.environ.get("MCPHUB_TOKEN"))
+AUTH = "Bearer ${MCPHUB_TOKEN}"
+BLADEBRO = "/usr/local/bin/bladebro-mcp"
+
+status = {"mcphub_configured": HAVE_MCPHUB, "sections": {}}
+
+
+def warn(message):
+    line = f"workstation-config: WARNING: {message}"
+    print(line, file=sys.stderr, flush=True)
+    with open(WARNINGS, "a") as stream:
+        stream.write(line + "\n")
+
+
+def write(path, contents):
+    """Atomic 0600 replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        os.chmod(temporary, 0o600)
+        stream.write(contents)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_json(path):
+    value = json.loads(path.read_text()) if path.exists() else {}
+    if not isinstance(value, dict):
+        raise ValueError("configuration root must be an object")
+    return value
+
+
+def table(parent, key):
+    if key not in parent:
+        parent[key] = {}
+    if not isinstance(parent[key], dict):
+        raise ValueError(f"{key} must be a mapping")
+    return parent[key]
+
+
+def set_mcphub(servers, entry):
+    if HAVE_MCPHUB:
+        servers["mcphub"] = entry
+    else:
+        servers.pop("mcphub", None)
+
+
+def codex():
+    mode = os.environ.get("CODEX_SANDBOX_MODE", "danger-full-access")
+    approval = os.environ.get("CODEX_APPROVAL_POLICY", "never")
+    if mode not in ("read-only", "workspace-write", "danger-full-access"):
+        raise ValueError("invalid CODEX_SANDBOX_MODE")
+    if approval not in ("untrusted", "on-failure", "on-request", "never"):
+        raise ValueError("invalid CODEX_APPROVAL_POLICY")
+    path = CODEX / "config.toml"
+    config = tomlkit.parse(path.read_text()) if path.exists() else tomlkit.document()
+    # Defaults for sessions that do not choose a mode. Paseo sends the mode it
+    # is given: pick Full Access in Paseo for unrestricted Codex sessions.
+    config["sandbox_mode"] = mode
+    config["approval_policy"] = approval
+    config.setdefault("check_for_update_on_startup", False)
+    servers = config.setdefault("mcp_servers", tomlkit.table())
+    set_mcphub(servers, {"url": MCP_URL, "bearer_token_env_var": "MCPHUB_TOKEN"})
+    servers["bladebro"] = {"command": BLADEBRO}
+    rendered = tomlkit.dumps(config)
+    tomlkit.parse(rendered)
+    write(path, rendered)
+
+
+def claude():
+    path = CLAUDE / ".claude.json"
+    config = read_json(path)
+    servers = table(config, "mcpServers")
+    set_mcphub(servers, {"type": "http", "url": MCP_URL, "headers": {"Authorization": AUTH}})
+    servers["bladebro"] = {"type": "stdio", "command": BLADEBRO, "args": [], "env": {}}
+    write(path, json.dumps(config, indent=2) + "\n")
+
+
+def pi():
+    path = HOME / ".pi" / "agent" / "mcp.json"
+    config = read_json(path)
+    set_mcphub(table(config, "mcpServers"), {"url": MCP_URL, "headers": {"Authorization": AUTH}})
+    write(path, json.dumps(config, indent=2) + "\n")
+
+
+for name, section in (("codex", codex), ("claude", claude), ("pi", pi)):
+    try:
+        section()
+        status["sections"][name] = "configured"
+    except Exception as error:
+        # Exception text can echo config values: report only the type.
+        warn(f"{name} configuration failed ({type(error).__name__}); file left unchanged")
+        status["sections"][name] = "failed"
+
+write(PASEO / "workstation-status.json", json.dumps(status, indent=2) + "\n")

@@ -1,0 +1,10 @@
+{
+  "name": "marksman-lsp",
+  "version": "1.0.0",
+  "description": "Markdown language server (marksman): links, headings, references.",
+  "author": {
+    "name": "paseo-workstation",
+    "url": "https://github.com/RealBeepMcJeep/paseo-workstation"
+  },
+  "license": "MIT"
+}

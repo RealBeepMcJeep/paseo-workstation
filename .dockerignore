@@ -1,0 +1,4 @@
+# Only the Dockerfile and rootfs/ are needed in the build context.
+*
+!Dockerfile
+!rootfs

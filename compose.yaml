@@ -1,0 +1,74 @@
+# Paseo workstation (Dockge stack "paseo").
+# Image: https://github.com/RealBeepMcJeep/paseo-workstation, rebuilt and
+# self-tested by GitHub Actions whenever an upstream version changes.
+#
+# Update:   Dockge "Update" (pull + recreate). Recreating ends running agent
+#           sessions; their history is kept in the home dataset.
+# Rollback: set PASEO_IMAGE_TAG in the stack .env to an older tag
+#           (YYYYMMDD-HHMM or sha-xxxxxxx), then Update. Restore the home
+#           dataset from a TrueNAS snapshot if a newer agent migrated its data.
+#
+# Dockge .env: PASEO_PASSWORD (required); GITEA_URL, GITEA_USER, GITEA_TOKEN;
+# optional MCPHUB_KEY (MCPHub "paseo" group), GH_TOKEN, GIT_USER_NAME,
+# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG.
+services:
+  paseo:
+    image: ghcr.io/realbeepmcjeep/paseo-workstation:${PASEO_IMAGE_TAG:-latest}
+    container_name: paseo
+    hostname: paseo
+    user: "568:568"
+    restart: unless-stopped
+    stop_grace_period: 60s
+    # Chromium uses /dev/shm; four agents share one cgroup, so bound processes.
+    shm_size: 1gb
+    pids_limit: 4096
+    environment:
+      TZ: America/Phoenix
+      PASEO_PASSWORD: ${PASEO_PASSWORD:?Set PASEO_PASSWORD in the Dockge environment editor}
+      # app.paseo.sh and Android connect through the outbound relay; no ports.
+      PASEO_RELAY_ENABLED: "true"
+      GIT_USER_NAME: ${GIT_USER_NAME:-paseo}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-paseo@nobody.com}
+      GH_TOKEN: ${GH_TOKEN:-}
+      GITEA_URL: ${GITEA_URL:-}
+      GITEA_USER: ${GITEA_USER:-paseo}
+      GITEA_TOKEN: ${GITEA_TOKEN:-}
+      # Agents get an mcphub entry only when MCPHUB_KEY is set.
+      MCP_HOMELAB_URL: ${MCP_HOMELAB_URL:-http://mcphub:3000/mcp/paseo}
+      MCPHUB_TOKEN: ${MCPHUB_KEY:-}
+    volumes:
+      - type: bind
+        source: /mnt/tank3/apps/paseo/home
+        target: /home/paseo
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/tank3/apps/paseo/workspace
+        target: /workspace
+        bind:
+          create_host_path: false
+    networks:
+      - hermes_internal
+    extra_hosts:
+      - host.docker.internal:172.28.10.1
+    dns:
+      - 192.168.86.11
+      - 192.168.86.12
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          # A cap, not a reservation. Language servers and Chromium need more
+          # than the old 6g; raise only if memory.events shows pressure.
+          memory: ${PASEO_MEM_LIMIT:-12g}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+networks:
+  hermes_internal:
+    external: true
+    name: hermes_internal

@@ -1,0 +1,54 @@
+#!/bin/bash
+# Container entrypoint (under tini): prepare the home, configure Git/Gitea and
+# the agents' MCP entries, then exec the Paseo daemon.
+#
+# Only directory creation and the final exec may stop the container. Every
+# other step warns and continues, so Paseo stays reachable for repair from its
+# own terminal. Warnings: $PASEO_HOME/workstation-startup-warnings.txt
+set -euo pipefail
+umask 077
+
+mkdir -p "$PASEO_HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$CARGO_HOME" \
+  "$XDG_CONFIG_HOME/git" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+warnings="$PASEO_HOME/workstation-startup-warnings.txt"
+: > "$warnings"
+try() {
+  if ! "$@"; then
+    # Log only the command name; arguments can contain credentials.
+    printf 'workstation-start: WARNING: %s failed; continuing\n' "$1" | tee -a "$warnings" >&2
+  fi
+}
+
+[ -z "${GIT_USER_NAME:-}" ] || try git config --global user.name "$GIT_USER_NAME"
+[ -z "${GIT_USER_EMAIL:-}" ] || try git config --global user.email "$GIT_USER_EMAIL"
+try git config --global init.defaultBranch main
+if [ -n "${GH_TOKEN:-}" ]; then
+  try gh auth setup-git --hostname github.com
+fi
+
+if [ -n "${GITEA_URL:-}" ]; then
+  helper="credential.${GITEA_URL%/}.helper"
+  if [ -n "${GITEA_TOKEN:-}" ]; then
+    # The helper reads the token from the environment when Git asks; the token
+    # itself is never written to the Git config. Single quotes are deliberate.
+    # shellcheck disable=SC2016
+    try git config --global --replace-all "$helper" \
+      '!f() { test "$1" = get || exit 0; printf "%s\n" "username=${GITEA_USER:-paseo}" "password=$GITEA_TOKEN"; }; f'
+    # tea keeps logins in a 0600 file; refresh it from the Dockge token on
+    # every start so rotating the token in Dockge propagates. The token is
+    # passed through tea's own env variables, not argv.
+    tea logins delete gitea > /dev/null 2>&1 || true
+    GITEA_SERVER_URL="${GITEA_URL%/}" GITEA_SERVER_TOKEN="$GITEA_TOKEN" \
+      try tea logins add --name gitea > /dev/null
+    try tea logins default gitea > /dev/null
+  else
+    git config --global --unset-all "$helper" || true
+    tea logins delete gitea > /dev/null 2>&1 || true
+  fi
+fi
+
+# Agent MCP entries (mcphub, bladebro) and Codex defaults. Never fatal.
+try /usr/local/bin/workstation-config
+
+umask 027
+exec node "$(cat /etc/paseo-server-entry)" "$@"

@@ -1,0 +1,72 @@
+#!/bin/bash
+# Image build check, run as the runtime user. Every tool must start, or the
+# build fails and nothing is published. Output becomes
+# /etc/paseo-workstation/versions.txt.
+#
+# Output is captured into variables before matching: piping into `grep -q` or
+# `head` can SIGPIPE the producer and fail a correct build under pipefail.
+set -euo pipefail
+
+version() {
+  local label="$1" out
+  shift
+  out="$("$@" 2>&1)"
+  printf '%-22s %s\n' "$label" "${out%%$'\n'*}"
+}
+require() { grep -E "$1" <<< "$2" > /dev/null || { echo "missing: $3" >&2; exit 1; }; }
+
+test -f "$(cat /etc/paseo-server-entry)"
+version node            node --version
+version paseo           paseo --version
+version claude          claude --version
+version codex           codex --version
+version pi              pi --version
+version bladebro        bladebro --version
+version chromium        chromium --version
+version Xvfb            command -v Xvfb
+
+version rustc           rustc --version
+version cargo           cargo --version
+version rust-analyzer   rust-analyzer --version
+components="$(rustup component list --installed)"
+require '^rust-src' "$components" "rust-src component (rust-analyzer needs std sources)"
+targets="$(rustup target list --installed)"
+require '^wasm32-unknown-unknown$' "$targets" "wasm32-unknown-unknown target"
+
+sdks="$(dotnet --list-sdks)"
+printf '%-22s %s\n' dotnet-sdks "$(tr '\n' ' ' <<< "$sdks")"
+require '^8\.' "$sdks" ".NET 8 SDK"
+runtimes="$(dotnet --list-runtimes)"
+require '^Microsoft\.NETCore\.App 8\.' "$runtimes" ".NET 8 runtime"
+version csharp-ls       csharp-ls --version
+version ilspycmd        ilspycmd --version
+
+version python3         python3 --version
+python3 -c 'import sys, tomlkit; raise SystemExit(sys.version_info < (3, 12))'
+version uv              uv --version
+version ruff            ruff --version
+version pyright         pyright --version
+version ts-ls           typescript-language-server --version
+version tsc             tsc --version
+version yaml-ls         node -p "require('$(npm root -g)/yaml-language-server/package.json').version"
+version marksman        marksman --version
+
+version git             git --version
+version gh              gh --version
+version tea             tea --version
+version yq              yq --version
+version jq              jq --version
+version ripgrep         rg --version
+version fd              fd --version
+version sqlite3         sqlite3 --version
+version shellcheck      shellcheck --version
+version ffmpeg          ffmpeg -version
+version pdftotext       pdftotext -v
+version tmux            tmux -V
+version tini            tini --version
+
+# Image-owned Claude LSP plugins must pass strict validation.
+for plugin in /opt/claude-plugins/*/; do
+  claude plugin validate --strict "$plugin" > /dev/null
+  printf '%-22s %s\n' "plugin" "$(basename "$plugin") valid"
+done

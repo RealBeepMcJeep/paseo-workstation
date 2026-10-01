@@ -1,0 +1,90 @@
+#!/bin/bash
+# Functional self-test, run inside a started container:
+#   docker exec paseo workstation-selftest
+# CI runs it before publishing. It works in a scratch directory, never touches
+# /workspace or agent configs, and needs no credentials. Exits 1 on failure.
+# Agent logins, MCPHub and real LSP sessions are checked by using the agents.
+set -uo pipefail
+failures=0
+scratch="$(mktemp -d /tmp/workstation-selftest.XXXXXX)"
+log="$scratch/check.log"
+trap 'rm -rf "$scratch"' EXIT
+
+check() {
+  local name="$1"
+  shift
+  if (cd "$scratch" && "$@") > "$log" 2>&1; then
+    printf 'PASS %s\n' "$name"
+  else
+    printf 'FAIL %s\n' "$name"
+    tail -n 15 "$log" | sed 's/^/     /'
+    failures=$((failures + 1))
+  fi
+}
+
+check 'paseo: /api/health' node -e \
+  "require('http').get('http://127.0.0.1:6767/api/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
+if [ -f "$PASEO_HOME/workstation-status.json" ]; then
+  check 'startup: config sections configured' \
+    jq -e '[.sections[] | select(. != "configured")] | length == 0' "$PASEO_HOME/workstation-status.json"
+fi
+
+check 'chromium: headless render' bash -c '
+  timeout 60 chromium --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+    --dump-dom "data:text/html,<p>workstation-ok</p>" > dom.html
+  grep -F workstation-ok dom.html'
+check 'bladebro: MCP handshake lists tools' timeout 60 node -e '
+  const child = require("child_process").spawn("bladebro-mcp", [], { stdio: ["pipe", "pipe", "inherit"] });
+  const send = (message) => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
+  let buffer = "";
+  child.stdout.on("data", (chunk) => {
+    buffer += chunk;
+    for (let i; (i = buffer.indexOf("\n")) >= 0; buffer = buffer.slice(i + 1)) {
+      const message = JSON.parse(buffer.slice(0, i));
+      if (message.id === 1) {
+        send({ method: "notifications/initialized" });
+        send({ id: 2, method: "tools/list" });
+      } else if (message.id === 2) {
+        const names = (message.result?.tools ?? []).map((tool) => tool.name);
+        console.log("tools:", names.join(", "));
+        child.kill();
+        process.exit(names.length > 0 ? 0 : 1);
+      }
+    }
+  });
+  send({ id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {},
+         clientInfo: { name: "workstation-selftest", version: "1" } } });'
+
+check 'rust: native build' bash -c \
+  'cargo new --lib --vcs none rs > /dev/null && cargo build --offline --manifest-path rs/Cargo.toml'
+check 'rust: wasm32 build' \
+  cargo build --offline --manifest-path rs/Cargo.toml --target wasm32-unknown-unknown
+# shellcheck disable=SC2016  # expands inside the child bash
+check 'rust: std sources for rust-analyzer' bash -c \
+  'test -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library"'
+
+check 'dotnet: net8.0 build' bash -c \
+  'dotnet new classlib -f net8.0 -o cs8 > /dev/null && dotnet build cs8'
+check 'dotnet: ilspycmd decompiles the build' bash -c \
+  'ilspycmd cs8/bin/Debug/net8.0/cs8.dll > decompiled.cs && grep -F "namespace cs8" decompiled.cs'
+check 'dotnet: SDK-style net48 + C# 12 build (restores reference assemblies)' bash -c '
+  mkdir -p cs48
+  printf "%s\n" "<Project Sdk=\"Microsoft.NET.Sdk\">" \
+    "  <PropertyGroup><TargetFramework>net48</TargetFramework><LangVersion>12</LangVersion></PropertyGroup>" \
+    "</Project>" > cs48/cs48.csproj
+  printf "%s\n" "namespace Cs48 { public static class Probe { public static int Value => 48; } }" > cs48/Probe.cs
+  dotnet build cs48'
+
+check 'python: pyright and ruff on a sample' bash -c \
+  'printf "def double(value: int) -> int:\n    return value * 2\n" > sample.py && pyright sample.py && ruff check sample.py'
+check 'typescript: tsc on a sample' bash -c \
+  'printf "export const double = (value: number): number => value * 2;\n" > sample.ts && tsc --noEmit --strict sample.ts'
+check 'shell: shellcheck on a sample' bash -c \
+  'printf "#!/bin/sh\necho \"ok\"\n" > sample.sh && shellcheck sample.sh'
+
+if [ -r /sys/fs/cgroup/memory.current ]; then
+  printf 'INFO memory: current %s, peak %s, limit %s\n' "$(cat /sys/fs/cgroup/memory.current)" \
+    "$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo unknown)" "$(cat /sys/fs/cgroup/memory.max)"
+fi
+printf '%s check(s) failed\n' "$failures"
+[ "$failures" -eq 0 ]

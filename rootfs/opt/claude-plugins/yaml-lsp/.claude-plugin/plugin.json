@@ -1,0 +1,10 @@
+{
+  "name": "yaml-lsp",
+  "version": "1.0.0",
+  "description": "YAML language server with SchemaStore schemas (Compose files, GitHub Actions workflows).",
+  "author": {
+    "name": "paseo-workstation",
+    "url": "https://github.com/RealBeepMcJeep/paseo-workstation"
+  },
+  "license": "MIT"
+}

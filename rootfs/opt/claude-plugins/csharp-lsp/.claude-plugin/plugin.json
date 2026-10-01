@@ -1,0 +1,10 @@
+{
+  "name": "csharp-lsp",
+  "version": "1.0.0",
+  "description": "C# language server (csharp-ls). Server definition copied from anthropics/claude-plugins-official.",
+  "author": {
+    "name": "paseo-workstation",
+    "url": "https://github.com/RealBeepMcJeep/paseo-workstation"
+  },
+  "license": "MIT"
+}
