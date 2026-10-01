@@ -135,11 +135,17 @@ RUN npm install -g --no-audit --no-fund \
          "yaml-language-server@$YAML_LS_VERSION" \
     && npm cache clean --force
 
-# Paseo daemon, installed from npm exactly as upstream's own image does.
+# Paseo daemon from npm. Installing only @getpaseo/cli nests the server under
+# the CLI (upstream's image installs every package, so its server is top
+# level); accept either layout.
 ARG PASEO_VERSION=latest
 RUN npm install -g --no-audit --no-fund "@getpaseo/cli@$PASEO_VERSION" \
     && npm cache clean --force \
-    && entry="$(npm root -g)/@getpaseo/server/dist/scripts/supervisor-entrypoint.js" \
+    && root="$(npm root -g)" \
+    && for entry in "$root/@getpaseo/cli/node_modules/@getpaseo/server" "$root/@getpaseo/server"; do \
+         entry="$entry/dist/scripts/supervisor-entrypoint.js"; \
+         if [ -f "$entry" ]; then break; fi; \
+       done \
     && node --check "$entry" \
     && echo "$entry" > /etc/paseo-server-entry
 
