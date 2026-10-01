@@ -54,7 +54,7 @@ jobs:
       - name: Probe upstream versions
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/probe-versions.sh | tee versions.env
+        run: bash scripts/probe-versions.sh | tee versions.env
 
       - name: Compare with the published image
         id: decide

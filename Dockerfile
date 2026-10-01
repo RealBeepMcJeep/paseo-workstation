@@ -158,6 +158,9 @@ RUN npm install -g --no-audit --no-fund \
     && npm cache clean --force
 
 COPY rootfs/ /
+# Belt and braces: the repo is edited on a dataset without exec bits, where Git
+# can record new scripts as 644.
+RUN chmod 755 /usr/local/bin/workstation-* /usr/local/bin/bladebro-mcp
 
 # Updates come from new images, not in-app updaters. CHROME_PATH and
 # BLADE_* configure bladebro for the image's Chromium; --no-sandbox because
