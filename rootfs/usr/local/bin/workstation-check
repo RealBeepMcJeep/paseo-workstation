@@ -15,6 +15,8 @@ version() {
 }
 require() { grep -E "$1" <<< "$2" > /dev/null || { echo "missing: $3" >&2; exit 1; }; }
 
+# Agent CLIs warn (instead of printing a version) when their homes are missing.
+mkdir -p "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
 test -f "$(cat /etc/paseo-server-entry)"
 version node            node --version
 version paseo           paseo --version
