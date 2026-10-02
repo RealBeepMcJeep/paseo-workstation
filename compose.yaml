@@ -19,9 +19,8 @@ services:
     user: "568:568"
     restart: unless-stopped
     stop_grace_period: 60s
-    # Chromium uses /dev/shm; four agents share one cgroup, so bound processes.
+    # Chromium uses /dev/shm.
     shm_size: 1gb
-    pids_limit: 4096
     environment:
       TZ: America/Phoenix
       PASEO_PASSWORD: ${PASEO_PASSWORD:?Set PASEO_PASSWORD in the Dockge environment editor}
@@ -62,6 +61,9 @@ services:
           # A cap, not a reservation. Language servers and Chromium need more
           # than the old 6g; raise only if memory.events shows pressure.
           memory: ${PASEO_MEM_LIMIT:-12g}
+          # The agents share one cgroup: bound runaway process trees. (Must
+          # live here: Compose rejects pids_limit next to deploy limits.)
+          pids: 4096
     logging:
       driver: json-file
       options:
