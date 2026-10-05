@@ -8,7 +8,8 @@
 #           (YYYYMMDD-HHMM or sha-xxxxxxx), then Update. Restore the home
 #           dataset from a TrueNAS snapshot if a newer agent migrated its data.
 #
-# Dockge .env: PASEO_PASSWORD (required); GITEA_URL, GITEA_USER, GITEA_TOKEN;
+# Dockge .env: PASEO_PASSWORD (required); GITEA_URL (http://host.docker.internal:3000),
+# GITEA_USER, GITEA_TOKEN;
 # optional MCPHUB_KEY (MCPHub "paseo" group), GH_TOKEN, GIT_USER_NAME,
 # GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG.
 services:
@@ -46,8 +47,13 @@ services:
         target: /workspace
         bind:
           create_host_path: false
+    # macvlan gives Paseo its own LAN IP, so agents can serve ad-hoc ports to the
+    # LAN (bind 0.0.0.0, ports >= 1024). macvlan cannot reach its own host:
+    # address host services as host.docker.internal (GITEA_URL in .env too).
     networks:
-      - hermes_internal
+      adguard-home_macvlan:
+        ipv4_address: 192.168.87.49
+      hermes_internal: null
     extra_hosts:
       - host.docker.internal:172.28.10.1
     dns:
@@ -74,3 +80,5 @@ networks:
   hermes_internal:
     external: true
     name: hermes_internal
+  adguard-home_macvlan:
+    external: true
