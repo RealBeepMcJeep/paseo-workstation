@@ -12,7 +12,8 @@
 # Dockge .env: PASEO_PASSWORD (required); GITEA_URL (http://host.docker.internal:3000),
 # GITEA_USER, GITEA_TOKEN;
 # optional MCPHUB_KEY (MCPHub "paseo" group), GH_TOKEN, GIT_USER_NAME,
-# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG.
+# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG, and for the proxy
+# PROXY_DOMAIN, PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN.
 services:
   paseo:
     image: ghcr.io/realbeepmcjeep/paseo-workstation:${PASEO_IMAGE_TAG:-latest}
@@ -38,6 +39,11 @@ services:
       # Agents get an mcphub entry only when MCPHUB_KEY is set.
       MCP_HOMELAB_URL: ${MCP_HOMELAB_URL:-http://mcphub:3000/mcp/paseo}
       MCPHUB_TOKEN: ${MCPHUB_KEY:-}
+      # Optional subdomain proxy (see README): off unless a domain is set.
+      PROXY_DOMAIN: ${PROXY_DOMAIN:-}
+      PROXY_LAN_DOMAIN: ${PROXY_LAN_DOMAIN:-}
+      PROXY_BIND: ${PROXY_BIND:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
     volumes:
       - type: bind
         source: /mnt/tank3/apps/paseo/home
