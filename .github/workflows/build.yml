@@ -171,7 +171,10 @@ jobs:
       # stay hidden), a symlink that must be rejected, and a shutdown hook.
       - name: Self-test a running container
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          # Failures are reported as annotations too (readable without signing in).
+          annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
+          trap 'rc=$?; { echo "command: $BASH_COMMAND (exit $rc)"; docker logs smoke 2>&1 | tail -n 30; } 2>&1 | annotate selftest-step' ERR
           mkdir -p /tmp/smoke/home/.config/workstation /tmp/smoke/workspace/proxy/sites \
             /tmp/smoke/workspace/proxy/www/hello /tmp/smoke/workspace/upstream
           cat > /tmp/smoke/home/.config/workstation/autostart <<'EOF'
@@ -200,18 +203,16 @@ jobs:
             [ "$(docker inspect -f '{{.State.Running}}' smoke)" = true ] || break
             sleep 5
           done
-          # Failures are also reported as annotations (readable without signing in).
-          annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
           docker logs smoke 2>&1 | tail -n 40
           if [ "$state" != healthy ]; then
-            docker logs smoke 2>&1 | tail -n 40 | annotate "container never became healthy"
+            docker logs smoke 2>&1 | tail -n 40 | annotate unhealthy
             exit 1
           fi
           docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
           for _ in $(seq 1 30); do docker exec smoke workstation-proxy status > /dev/null && break; sleep 1; done
           if ! docker exec smoke workstation-selftest | tee selftest.log; then
             { grep -A 15 '^FAIL' selftest.log; echo '--- workstation-proxy status'; docker exec smoke workstation-proxy status;
-              echo '--- container log'; docker logs smoke 2>&1 | tail -n 25; } 2>&1 | head -n 90 | annotate "self-test failed"
+              echo '--- container log'; docker logs smoke 2>&1 | tail -n 25; } 2>&1 | head -n 90 | annotate selftest
             exit 1
           fi
 
