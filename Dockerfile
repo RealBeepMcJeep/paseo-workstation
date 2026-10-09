@@ -67,60 +67,84 @@ ENV HOME=/home/paseo \
     DOTNET_NOLOGO=1 \
     PATH=/opt/cargo/bin:/opt/dotnet:/opt/dotnet-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/paseo/.local/bin:/home/paseo/.cargo/bin:/home/paseo/.dotnet/tools
 
-# Rust stable with WASM. rust-src lets rust-analyzer resolve std. /opt/rustup is
-# owned by 568 so repos pinning another toolchain can install it at runtime
-# (lost on recreate, re-downloaded on demand).
+# Rust with WASM, at exactly the stable version the probe found. rust-src lets
+# rust-analyzer resolve std. /opt/rustup is owned by 568 so repos pinning another
+# toolchain can install it at runtime (lost on recreate, re-downloaded on demand).
+# rustup-init is checked against its published SHA-256 before it runs.
 ARG RUST_STABLE
-RUN echo "Rust stable: ${RUST_STABLE:-unpinned}" \
-    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o rustup-init.sh \
-    && CARGO_HOME=/opt/cargo sh rustup-init.sh -y --no-modify-path --profile minimal \
-         --default-toolchain stable \
+RUN : "${RUST_STABLE:?}" \
+    && rustup_dist=https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu \
+    && curl --proto '=https' --tlsv1.2 -fsSLO "$rustup_dist/rustup-init" \
+    && expected="$(curl --proto '=https' --tlsv1.2 -fsSL "$rustup_dist/rustup-init.sha256" | cut -d' ' -f1)" \
+    && echo "$expected  rustup-init" | sha256sum -c \
+    && chmod 755 rustup-init \
+    && CARGO_HOME=/opt/cargo ./rustup-init -y --no-modify-path --profile minimal \
+         --default-toolchain "$RUST_STABLE" \
          --component rustfmt,clippy,rust-analyzer,rust-src \
          --target wasm32-unknown-unknown \
-    && rm rustup-init.sh \
+    && rm rustup-init \
     && chown -R 568:568 /opt/rustup
 
 # .NET: SDK 8 for net8.0 mods/tests plus the current LTS SDK, which also runs
-# csharp-ls and ilspycmd. SDK-style net48/net472/net40 targets build through
-# reference-assembly packages restored from NuGet.
+# csharp-ls and ilspycmd, both at exactly the versions the probe found (oldest
+# first). SDK-style net48/net472/net40 targets build through reference-assembly
+# packages restored from NuGet.
 ARG DOTNET8_SDK
-ARG DOTNET_LTS_CHANNEL=LTS
+ARG DOTNET_LTS_CHANNEL
 ARG DOTNET_LTS_SDK
 ARG CSHARP_LS_VERSION
 ARG ILSPYCMD_VERSION
-RUN echo ".NET SDKs: ${DOTNET8_SDK:-8.0 latest}, ${DOTNET_LTS_SDK:-${DOTNET_LTS_CHANNEL} latest}" \
+RUN : "${DOTNET8_SDK:?}" "${DOTNET_LTS_SDK:?}" \
+    && echo ".NET SDKs: $DOTNET8_SDK and $DOTNET_LTS_SDK (LTS channel ${DOTNET_LTS_CHANNEL:-?})" \
     && curl -fsSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh \
-    && bash dotnet-install.sh --channel 8.0 --install-dir /opt/dotnet --no-path \
-    && bash dotnet-install.sh --channel "$DOTNET_LTS_CHANNEL" --install-dir /opt/dotnet --no-path \
+    && bash dotnet-install.sh --version "$DOTNET8_SDK" --install-dir /opt/dotnet --no-path \
+    && bash dotnet-install.sh --version "$DOTNET_LTS_SDK" --install-dir /opt/dotnet --no-path \
     && export DOTNET_CLI_HOME=/tmp/dotnet-home NUGET_PACKAGES=/tmp/nuget \
     && /opt/dotnet/dotnet tool install --tool-path /opt/dotnet-tools csharp-ls ${CSHARP_LS_VERSION:+--version "$CSHARP_LS_VERSION"} \
     && /opt/dotnet/dotnet tool install --tool-path /opt/dotnet-tools ilspycmd ${ILSPYCMD_VERSION:+--version "$ILSPYCMD_VERSION"} \
     && rm -rf dotnet-install.sh /tmp/dotnet-home /tmp/nuget
 
-# Single-binary tools from upstream releases (exact versions from the probe).
+# Single-binary tools from upstream releases, at the probe's exact versions. Every
+# download is checked before install: uv and ruff against their published SHA-256
+# files; marksman, yq and gh against the SHA-256 GitHub recorded for the release
+# asset (captured by the probe, so it is part of the fingerprint); tea against
+# its published .sha256 file.
 ARG UV_VERSION
 ARG RUFF_VERSION
 ARG MARKSMAN_VERSION
+ARG MARKSMAN_SHA256
 ARG YQ_VERSION
+ARG YQ_SHA256
 ARG GH_VERSION
+ARG GH_SHA256
 ARG TEA_VERSION
-# uv and ruff are verified against their published SHA-256 files.
-RUN : "${UV_VERSION:?}" "${RUFF_VERSION:?}" "${MARKSMAN_VERSION:?}" "${YQ_VERSION:?}" "${GH_VERSION:?}" "${TEA_VERSION:?}" \
+RUN : "${UV_VERSION:?}" "${RUFF_VERSION:?}" "${MARKSMAN_VERSION:?}" "${MARKSMAN_SHA256:?}" \
+      "${YQ_VERSION:?}" "${YQ_SHA256:?}" "${GH_VERSION:?}" "${GH_SHA256:?}" "${TEA_VERSION:?}" \
     && gh_release() { echo "https://github.com/$1/releases/download/$2/$3"; } \
     && fetch_verified() { curl -fsSLO "$(gh_release "$@")" && curl -fsSLO "$(gh_release "$1" "$2" "$3.sha256")" && sha256sum -c "$3.sha256"; } \
+    && verify() { echo "$1  $2" | sha256sum -c; } \
     && fetch_verified astral-sh/uv "$UV_VERSION" uv-x86_64-unknown-linux-gnu.tar.gz \
     && tar -xzf uv-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C /usr/local/bin \
          uv-x86_64-unknown-linux-gnu/uv uv-x86_64-unknown-linux-gnu/uvx \
     && fetch_verified astral-sh/ruff "$RUFF_VERSION" ruff-x86_64-unknown-linux-gnu.tar.gz \
     && tar -xzf ruff-x86_64-unknown-linux-gnu.tar.gz --strip-components=1 -C /usr/local/bin \
          ruff-x86_64-unknown-linux-gnu/ruff \
-    && rm -f ./*.tar.gz ./*.sha256 \
-    && curl -fsSL -o /usr/local/bin/marksman "$(gh_release artempyanykh/marksman "$MARKSMAN_VERSION" marksman-linux-x64)" \
-    && curl -fsSL -o /usr/local/bin/yq "$(gh_release mikefarah/yq "$YQ_VERSION" yq_linux_amd64)" \
-    && curl -fsSL "$(gh_release cli/cli "$GH_VERSION" "gh_${GH_VERSION#v}_linux_amd64.tar.gz")" \
-         | tar -xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION#v}_linux_amd64/bin/gh" \
-    && curl -fsSL -o /usr/local/bin/tea "https://dl.gitea.com/tea/${TEA_VERSION#v}/tea-${TEA_VERSION#v}-linux-amd64" \
-    && chmod 755 /usr/local/bin/marksman /usr/local/bin/yq /usr/local/bin/tea
+    && curl -fsSL -o marksman "$(gh_release artempyanykh/marksman "$MARKSMAN_VERSION" marksman-linux-x64)" \
+    && verify "$MARKSMAN_SHA256" marksman \
+    && install -m 755 marksman /usr/local/bin/marksman \
+    && curl -fsSL -o yq "$(gh_release mikefarah/yq "$YQ_VERSION" yq_linux_amd64)" \
+    && verify "$YQ_SHA256" yq \
+    && install -m 755 yq /usr/local/bin/yq \
+    && gh_asset="gh_${GH_VERSION#v}_linux_amd64" \
+    && curl -fsSL -o gh.tar.gz "$(gh_release cli/cli "$GH_VERSION" "$gh_asset.tar.gz")" \
+    && verify "$GH_SHA256" gh.tar.gz \
+    && tar -xzf gh.tar.gz --strip-components=2 -C /usr/local/bin "$gh_asset/bin/gh" \
+    && tea_file="tea-${TEA_VERSION#v}-linux-amd64" \
+    && curl -fsSLO "https://dl.gitea.com/tea/${TEA_VERSION#v}/$tea_file" \
+    && curl -fsSLO "https://dl.gitea.com/tea/${TEA_VERSION#v}/$tea_file.sha256" \
+    && sha256sum -c "$tea_file.sha256" \
+    && install -m 755 "$tea_file" /usr/local/bin/tea \
+    && rm -f ./*.tar.gz ./*.sha256 marksman yq "$tea_file"
 
 # npm language servers. typescript@6 stays on major 6: TypeScript 7 (the Go
 # port) ships no tsserver.js for typescript-language-server.

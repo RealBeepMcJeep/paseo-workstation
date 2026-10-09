@@ -2,17 +2,20 @@
 # only when something changed. The repo is pushed here by a one-way Gitea push
 # mirror, so this workflow never writes to the repository.
 #
-# "Changed" = the hash of scripts/probe-versions.sh output plus the Dockerfile
-# and rootfs/ differs from the fingerprint label on :latest. The probe output
+# "Changed" = the hash of scripts/probe-versions.sh output plus every tracked
+# build input (Dockerfile, rootfs/, .dockerignore, the probe script and this
+# workflow) differs from the fingerprint label on :latest. The probe output
 # includes the ISO week, so Debian updates are picked up at least weekly.
 #
-# Tags: :latest, :YYYYMMDD-HHMM and :sha-<commit> (the dated tags are rollback
-# points). Nothing is pushed unless the build checks and self-test pass.
+# Tags: :latest, :YYYYMMDD-HHMMSS and :sha-<commit>. Roll back with dated tags:
+# scheduled rebuilds of one commit reuse its sha- tag. Nothing is pushed unless
+# the build checks and self-test pass. Pushes to other branches (pull requests,
+# mirrored from Gitea) always build and self-test, but never publish.
 name: Build image
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
@@ -28,7 +31,7 @@ permissions:
   actions: write # re-enable this workflow so the schedule never lapses
 
 concurrency:
-  group: build-image
+  group: build-image-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -37,6 +40,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       build: ${{ steps.decide.outputs.build }}
+      publish: ${{ steps.decide.outputs.publish }}
       image: ${{ steps.decide.outputs.image }}
       fingerprint: ${{ steps.decide.outputs.fingerprint }}
     steps:
@@ -63,21 +67,30 @@ jobs:
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${GITHUB_REPOSITORY#*/}"
-          fingerprint="$( { cat versions.env; git ls-files -s Dockerfile rootfs; } | sha256sum | cut -d' ' -f1)"
+          fingerprint="$( { cat versions.env; git ls-files -s Dockerfile rootfs .dockerignore \
+            scripts/probe-versions.sh .github/workflows/build.yml; } | sha256sum | cut -d' ' -f1)"
           labels="$(skopeo inspect --creds "${{ github.actor }}:${{ github.token }}" \
             --format '{{json .Labels}}' "docker://$image:latest" 2>/dev/null || echo '{}')"
           published="$(jq -r '."io.paseo-workstation.fingerprint" // ""' <<< "$labels")"
           jq -r '."io.paseo-workstation.inputs" // ""' <<< "$labels" | tr ' ' '\n' | sed '/^$/d' > published.env
 
           build=true
-          if [ "$published" = "$fingerprint" ] && [ "$FORCE" != true ]; then build=false; fi
+          publish=true
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            publish=false # branch/PR validation: always build and test, never publish
+          elif [ "$published" = "$fingerprint" ] && [ "$FORCE" != true ]; then
+            build=false
+          fi
           {
             echo "image=$image"
             echo "fingerprint=$fingerprint"
             echo "build=$build"
+            echo "publish=$publish"
           } >> "$GITHUB_OUTPUT"
           {
-            if [ "$build" = true ]; then echo "### Building a new image"; else echo "### Up to date: nothing to build"; fi
+            if [ "$publish" = false ]; then echo "### Branch build: test only, nothing will be published"
+            elif [ "$build" = true ]; then echo "### Building a new image"
+            else echo "### Up to date: nothing to build"; fi
             echo '```diff'
             diff -u published.env versions.env | tail -n +3 || true
             echo '```'
@@ -132,7 +145,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
-            type=raw,value={{date 'YYYYMMDD-HHmm'}}
+            type=raw,value={{date 'YYYYMMDD-HHmmss'}}
             type=sha,format=short,prefix=sha-
           labels: |
             io.paseo-workstation.fingerprint=${{ needs.probe.outputs.fingerprint }}
@@ -174,12 +187,16 @@ jobs:
           docker exec smoke workstation-selftest
 
       - name: Publish
+        if: needs.probe.outputs.publish == 'true'
         run: |
           set -euo pipefail
           while read -r tag; do docker push "$tag"; done <<< "${{ steps.meta.outputs.tags }}"
           {
             echo "### Published"
-            echo "$IMAGE:latest"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo "digest: $(docker image inspect --format '{{join .RepoDigests " "}}' "$IMAGE:latest")"
+            echo '```'
             echo '```'
             docker run --rm --entrypoint cat "$IMAGE:latest" /etc/paseo-workstation/versions.txt
             echo '```'

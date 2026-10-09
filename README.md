@@ -31,13 +31,14 @@ every 6 h ─► probe upstream versions ─► same as :latest? ─► stop (�
                                               │ no
                                               ▼
             build ─► build checks ─► run container + self-test ─► push :latest,
-                                                                  :YYYYMMDD-HHMM, :sha-…
+                                                                  :YYYYMMDD-HHMMSS, :sha-…
 ```
 
 - `scripts/probe-versions.sh` resolves every input to an exact version: the base
   image digest, npm packages, GitHub/NuGet releases, Rust stable, .NET SDKs, and
   the ISO week. The ISO week makes Debian security updates land at least weekly.
-- The hash of that output, plus `Dockerfile` and `rootfs/`, is stored as a label
+- The hash of that output, plus every tracked build input (`Dockerfile`, `rootfs/`,
+  `.dockerignore`, the probe script and the workflow), is stored as a label
   on the image. A scheduled run that computes the same hash builds nothing.
 - A failed build or self-test publishes nothing, so `:latest` is always a build
   that passed.
@@ -104,9 +105,12 @@ directory and needs no credentials.
 
 ## Rollback
 
-Set `PASEO_IMAGE_TAG` in the stack's `.env` to an earlier dated or `sha-` tag
-and click Update. If a newer agent version migrated its data, also restore the
-home dataset snapshot while the stack is stopped.
+Set `PASEO_IMAGE_TAG` in the stack's `.env` to an earlier **dated** tag
+(`YYYYMMDD-HHMMSS`) and click Update. Each dated tag is one specific build, and
+the workflow summary records its digest. Don't roll back with `sha-<commit>` tags:
+they name the source commit, and scheduled rebuilds of the same commit with newer
+upstream tools reuse them. If a newer agent version migrated its data, also
+restore the home dataset snapshot while the stack is stopped.
 
 ## Secrets
 
