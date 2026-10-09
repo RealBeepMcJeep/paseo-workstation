@@ -14,6 +14,9 @@ version() {
   printf '%-22s %s\n' "$label" "${out%%$'\n'*}"
 }
 require() { grep -E "$1" <<< "$2" > /dev/null || { echo "missing: $3" >&2; exit 1; }; }
+# Build arguments are visible here during the image build; the probe's exact
+# versions must be what actually got installed.
+escape() { printf '%s' "${1//./\\.}"; }
 
 # Agent CLIs warn (instead of printing a version) when their homes are missing.
 mkdir -p "$CODEX_HOME" "$CLAUDE_CONFIG_DIR"
@@ -30,6 +33,9 @@ version Xvfb            command -v Xvfb
 version rustc           rustc --version
 version cargo           cargo --version
 version rust-analyzer   rust-analyzer --version
+if [ -n "${RUST_STABLE:-}" ]; then
+  require "^rustc $(escape "$RUST_STABLE") " "$(rustc --version)" "Rust $RUST_STABLE (probed version)"
+fi
 components="$(rustup component list --installed)"
 require '^rust-src' "$components" "rust-src component (rust-analyzer needs std sources)"
 targets="$(rustup target list --installed)"
@@ -38,6 +44,9 @@ require '^wasm32-unknown-unknown$' "$targets" "wasm32-unknown-unknown target"
 sdks="$(dotnet --list-sdks)"
 printf '%-22s %s\n' dotnet-sdks "$(tr '\n' ' ' <<< "$sdks")"
 require '^8\.' "$sdks" ".NET 8 SDK"
+for sdk in ${DOTNET8_SDK:-} ${DOTNET_LTS_SDK:-}; do
+  require "^$(escape "$sdk") " "$sdks" ".NET SDK $sdk (probed version)"
+done
 runtimes="$(dotnet --list-runtimes)"
 require '^Microsoft\.NETCore\.App 8\.' "$runtimes" ".NET 8 runtime"
 version csharp-ls       csharp-ls --version

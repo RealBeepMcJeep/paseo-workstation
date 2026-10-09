@@ -4,8 +4,9 @@
 #
 # Update:   Dockge "Update" (pull + recreate). Recreating ends running agent
 #           sessions; their history is kept in the home dataset.
-# Rollback: set PASEO_IMAGE_TAG in the stack .env to an older tag
-#           (YYYYMMDD-HHMM or sha-xxxxxxx), then Update. Restore the home
+# Rollback: set PASEO_IMAGE_TAG in the stack .env to an older dated tag
+#           (YYYYMMDD-HHMMSS), then Update. sha-<commit> tags only name the
+#           source commit and are reused by scheduled rebuilds. Restore the home
 #           dataset from a TrueNAS snapshot if a newer agent migrated its data.
 #
 # Dockge .env: PASEO_PASSWORD (required); GITEA_URL (http://host.docker.internal:3000),
@@ -64,9 +65,10 @@ services:
     deploy:
       resources:
         limits:
-          # A cap, not a reservation. Language servers and Chromium need more
-          # than the old 6g; raise only if memory.events shows pressure.
-          memory: ${PASEO_MEM_LIMIT:-12g}
+          # A cap, not a reservation. 12g saw OOM kills with several agents,
+          # language servers, Chromium and project services; raise further only
+          # if memory.events shows new pressure.
+          memory: ${PASEO_MEM_LIMIT:-16g}
           # The agents share one cgroup: bound runaway process trees. (Must
           # live here: Compose rejects pids_limit next to deploy limits.)
           pids: 4096

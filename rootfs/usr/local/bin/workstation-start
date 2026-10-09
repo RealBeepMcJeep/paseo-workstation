@@ -41,6 +41,8 @@ if [ -n "${GITEA_URL:-}" ]; then
     GITEA_SERVER_URL="${GITEA_URL%/}" GITEA_SERVER_TOKEN="$GITEA_TOKEN" \
       try tea logins add --name gitea > /dev/null
     try tea logins default gitea > /dev/null
+    # Dataset ACLs can leave the file group-readable despite the umask.
+    chmod 600 "$XDG_CONFIG_HOME/tea/config.yml" 2> /dev/null || true
   else
     git config --global --unset-all "$helper" || true
     tea logins delete gitea > /dev/null 2>&1 || true

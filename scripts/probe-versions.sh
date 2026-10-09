@@ -11,9 +11,15 @@ emit() {
   [ -n "$2" ] || { echo "probe: no value for $1" >&2; exit 1; }
   printf '%s=%s\n' "$1" "$2"
 }
-github_latest() {
+github_release() {
   curl -fsSL ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
-    "https://api.github.com/repos/$1/releases/latest" | jq -er .tag_name
+    "https://api.github.com/repos/$1/releases/latest"
+}
+github_latest() { github_release "$1" | jq -er .tag_name; }
+asset_sha256() {
+  # SHA-256 that GitHub records for a release asset; the build verifies against it.
+  jq -er --arg name "$2" '.assets[] | select(.name == $name) | .digest
+    | select(startswith("sha256:")) | ltrimstr("sha256:")' <<<"$1"
 }
 npm_latest() {
   # Highest version matching a range ("latest" when no range is given).
@@ -56,9 +62,16 @@ emit CSHARP_LS_VERSION "$(nuget_latest csharp-ls)"
 emit ILSPYCMD_VERSION "$(nuget_latest ilspycmd)"
 emit UV_VERSION "$(github_latest astral-sh/uv)"
 emit RUFF_VERSION "$(github_latest astral-sh/ruff)"
-emit MARKSMAN_VERSION "$(github_latest artempyanykh/marksman)"
-emit YQ_VERSION "$(github_latest mikefarah/yq)"
-emit GH_VERSION "$(github_latest cli/cli)"
+marksman=$(github_release artempyanykh/marksman)
+emit MARKSMAN_VERSION "$(jq -er .tag_name <<<"$marksman")"
+emit MARKSMAN_SHA256 "$(asset_sha256 "$marksman" marksman-linux-x64)"
+yq=$(github_release mikefarah/yq)
+emit YQ_VERSION "$(jq -er .tag_name <<<"$yq")"
+emit YQ_SHA256 "$(asset_sha256 "$yq" yq_linux_amd64)"
+gh=$(github_release cli/cli)
+gh_version=$(jq -er .tag_name <<<"$gh")
+emit GH_VERSION "$gh_version"
+emit GH_SHA256 "$(asset_sha256 "$gh" "gh_${gh_version#v}_linux_amd64.tar.gz")"
 emit TEA_VERSION "$(curl -fsSL https://gitea.com/api/v1/repos/gitea/tea/releases/latest | jq -er .tag_name)"
 emit PYRIGHT_VERSION "$(npm_latest pyright)"
 emit TS_LS_VERSION "$(npm_latest typescript-language-server)"
