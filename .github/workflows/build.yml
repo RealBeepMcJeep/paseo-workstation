@@ -174,7 +174,7 @@ jobs:
           set -Eeuo pipefail
           # Failures are reported as annotations too (readable without signing in).
           annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
-          trap 'rc=$?; { echo "command: $BASH_COMMAND (exit $rc)"; docker logs smoke 2>&1 | tail -n 30; } 2>&1 | annotate selftest-step' ERR
+          trap 'rc=$?; trap - ERR; { echo "command: $BASH_COMMAND (exit $rc)"; docker logs smoke 2>&1 | grep -v "^{" | tail -n 30; } 2>&1 | annotate selftest-step' ERR
           mkdir -p /tmp/smoke/home/.config/workstation /tmp/smoke/workspace/proxy/sites \
             /tmp/smoke/workspace/proxy/www/hello /tmp/smoke/workspace/upstream
           cat > /tmp/smoke/home/.config/workstation/autostart <<'EOF'
@@ -210,9 +210,11 @@ jobs:
           fi
           docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
           for _ in $(seq 1 30); do docker exec smoke workstation-proxy status > /dev/null && break; sleep 1; done
-          if ! docker exec smoke workstation-selftest | tee selftest.log; then
-            { grep -A 15 '^FAIL' selftest.log; echo '--- workstation-proxy status'; docker exec smoke workstation-proxy status;
-              echo '--- container log'; docker logs smoke 2>&1 | tail -n 25; } 2>&1 | head -n 90 | annotate selftest
+          if ! docker exec smoke workstation-selftest 2>&1 | tee selftest.log; then
+            trap - ERR
+            { grep -A 15 '^FAIL' selftest.log || tail -n 20 selftest.log; echo '--- workstation-proxy status';
+              docker exec smoke workstation-proxy status || true; echo '--- container log (non-JSON lines)';
+              docker logs smoke 2>&1 | grep -v '^{' | tail -n 25; } 2>&1 | head -n 90 | annotate selftest
             exit 1
           fi
 

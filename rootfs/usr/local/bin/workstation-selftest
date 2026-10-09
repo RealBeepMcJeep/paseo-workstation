@@ -84,7 +84,8 @@ check 'shell: shellcheck on a sample' bash -c \
 
 if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
   # Requests go to the address Caddy listens on (first PROXY_BIND entry, else loopback).
-  read -r proxy_ip _ <<< "${PROXY_BIND//,/ }"
+  bind="${PROXY_BIND:-127.0.0.1}"
+  read -r proxy_ip _ <<< "${bind//,/ }"
   proxy_ip="${proxy_ip:-127.0.0.1}"
   export proxy_ip
   check 'proxy: running with a valid configuration' workstation-proxy status
