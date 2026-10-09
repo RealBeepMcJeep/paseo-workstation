@@ -56,8 +56,9 @@ services:
         bind:
           create_host_path: false
     # macvlan gives Paseo its own LAN IP, so agents can serve ad-hoc ports to the
-    # LAN (bind 0.0.0.0, ports >= 1024). macvlan cannot reach its own host:
-    # address host services as host.docker.internal (GITEA_URL in .env too).
+    # LAN (bind 0.0.0.0; any port), or publish through the proxy instead. macvlan
+    # cannot reach its own host: address host services as host.docker.internal
+    # (GITEA_URL in .env too).
     networks:
       adguard-home_macvlan:
         ipv4_address: 192.168.87.49
