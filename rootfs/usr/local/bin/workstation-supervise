@@ -1,0 +1,110 @@
+#!/bin/bash
+# Lifecycle owner, started by workstation-start under tini. It runs Paseo, the
+# optional Caddy proxy (workstation-proxy) and the optional autostart hook. On
+# Stop/Update (SIGTERM) it runs the optional shutdown hook, then stops the proxy
+# and Paseo cleanly, all within compose's stop_grace_period (120s).
+#
+# Optional hooks, executable files owned by the user (never required):
+#   ~/.config/workstation/autostart  runs once after Paseo answers its health check
+#   ~/.config/workstation/shutdown   runs first on Stop/Update (75s limit), e.g.
+#                                    to stop project services cleanly
+# Hook output goes to ~/.paseo/autostart.log (rotated at 1 MiB).
+set -uo pipefail
+
+hooks="$XDG_CONFIG_HOME/workstation"
+hook_log="$PASEO_HOME/autostart.log"
+paseo_port="${PASEO_LISTEN##*:}"
+stopping=0
+proxy_pid=""
+autostart_pid=""
+trap 'stopping=1' TERM INT
+
+say() { printf 'workstation-supervise: %s\n' "$*" >&2; }
+
+run_hook() { # name seconds
+  local hook="$hooks/$1" status
+  [ -x "$hook" ] || return 0
+  if [ -f "$hook_log" ] && [ "$(stat -c %s "$hook_log")" -gt 1048576 ]; then
+    mv -f "$hook_log" "$hook_log.1"
+  fi
+  printf '== %s %s: start\n' "$(date -Is)" "$1" >> "$hook_log"
+  (cd "$HOME" && exec timeout "$2" "$hook") >> "$hook_log" 2>&1
+  status=$?
+  printf '== %s %s: exit %s\n' "$(date -Is)" "$1" "$status" >> "$hook_log"
+  [ "$status" -eq 0 ] || say "$1 hook exited $status (see $hook_log)"
+}
+
+wait_gone() { # pid seconds: wait up to the limit for a process to exit
+  local deadline=$((SECONDS + $2))
+  while kill -0 "$1" 2> /dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.5; done
+  ! kill -0 "$1" 2> /dev/null
+}
+
+proxy_loop() {
+  # Restart Caddy if it exits on its own; stop it gracefully on TERM.
+  local caddy_pid="" quit=0
+  trap 'quit=1; [ -n "$caddy_pid" ] && kill -TERM "$caddy_pid" 2> /dev/null' TERM
+  while [ "$quit" -eq 0 ]; do
+    workstation-proxy run &
+    caddy_pid=$!
+    wait "$caddy_pid"
+    [ "$quit" -eq 1 ] && { wait_gone "$caddy_pid" 15 || kill -KILL "$caddy_pid" 2> /dev/null; break; }
+    say "proxy exited; restarting in 5s (see: workstation-proxy status)"
+    sleep 5 &
+    wait $!
+  done
+}
+
+if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
+  # Let Paseo accept its web UI through the proxy at paseo.<domain>.
+  for domain in ${PROXY_DOMAIN:-} ${PROXY_LAN_DOMAIN:-}; do
+    PASEO_HOSTNAMES="${PASEO_HOSTNAMES:+$PASEO_HOSTNAMES,}paseo.$domain"
+  done
+  export PASEO_HOSTNAMES
+fi
+
+node "$(cat /etc/paseo-server-entry)" "$@" &
+paseo_pid=$!
+
+if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
+  proxy_loop &
+  proxy_pid=$!
+fi
+
+if [ -x "$hooks/autostart" ]; then
+  (
+    trap - TERM INT
+    for _ in $(seq 1 120); do
+      curl -fsS -o /dev/null "http://127.0.0.1:$paseo_port/api/health" && break
+      sleep 1
+    done
+    run_hook autostart 600
+  ) &
+  autostart_pid=$!
+fi
+
+# Wait until Paseo exits on its own or the container is asked to stop.
+while kill -0 "$paseo_pid" 2> /dev/null && [ "$stopping" -eq 0 ]; do
+  wait "$paseo_pid"
+done
+paseo_status=0
+if ! kill -0 "$paseo_pid" 2> /dev/null; then
+  wait "$paseo_pid"
+  paseo_status=$?
+  [ "$stopping" -eq 1 ] || say "Paseo exited ($paseo_status); stopping the container"
+fi
+
+say "stopping"
+[ -n "$autostart_pid" ] && kill -TERM "$autostart_pid" 2> /dev/null
+run_hook shutdown 75
+if [ -n "$proxy_pid" ]; then
+  kill -TERM "$proxy_pid" 2> /dev/null
+  wait_gone "$proxy_pid" 20 || kill -KILL "$proxy_pid" 2> /dev/null
+fi
+if kill -0 "$paseo_pid" 2> /dev/null; then
+  kill -TERM "$paseo_pid" 2> /dev/null
+  wait_gone "$paseo_pid" 20 || { say "Paseo did not stop in time; killing"; kill -KILL "$paseo_pid" 2> /dev/null; }
+fi
+say "stopped"
+[ "$stopping" -eq 1 ] && exit 0
+exit "$paseo_status"

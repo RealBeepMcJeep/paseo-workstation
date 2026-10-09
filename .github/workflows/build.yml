@@ -166,13 +166,32 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
+      # Fixtures: a LAN-only proxy, an autostart hook that starts an upstream
+      # server, a site file for it, a static folder (with a dotfile that must
+      # stay hidden), a symlink that must be rejected, and a shutdown hook.
       - name: Self-test a running container
         run: |
           set -euo pipefail
-          mkdir -p /tmp/smoke/home /tmp/smoke/workspace
+          mkdir -p /tmp/smoke/home/.config/workstation /tmp/smoke/workspace/proxy/sites \
+            /tmp/smoke/workspace/proxy/www/hello /tmp/smoke/workspace/upstream
+          cat > /tmp/smoke/home/.config/workstation/autostart <<'EOF'
+          #!/bin/sh
+          echo upstream-ok > /workspace/upstream/marker.txt
+          cd /workspace/upstream && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &
+          touch "$HOME/autostart-ran"
+          EOF
+          cat > /tmp/smoke/home/.config/workstation/shutdown <<'EOF'
+          #!/bin/sh
+          touch "$HOME/shutdown-ran"
+          EOF
+          chmod 755 /tmp/smoke/home/.config/workstation/*
+          echo 'import proxy upstream 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
+          echo '<p>hello static</p>' > /tmp/smoke/workspace/proxy/www/hello/index.html
+          echo 'SECRET=1' > /tmp/smoke/workspace/proxy/www/hello/.env
+          ln -s /etc /tmp/smoke/workspace/proxy/www/escape
           sudo chown -R 568:568 /tmp/smoke
           docker run -d --name smoke --user 568:568 --shm-size 1g --security-opt no-new-privileges:true \
-            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false \
+            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_LAN_DOMAIN=selftest.lan \
             -v /tmp/smoke/home:/home/paseo -v /tmp/smoke/workspace:/workspace \
             "$IMAGE:latest"
           for _ in $(seq 1 60); do
@@ -184,7 +203,28 @@ jobs:
           docker logs smoke 2>&1 | tail -n 40
           [ "$state" = healthy ] || { echo "container never became healthy"; exit 1; }
           docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
+          for _ in $(seq 1 30); do docker exec smoke workstation-proxy status > /dev/null && break; sleep 1; done
           docker exec smoke workstation-selftest
+
+      - name: Proxy fixtures, autostart and a graceful stop
+        run: |
+          set -euo pipefail
+          get() { docker exec smoke curl -s -o /dev/null -w '%{http_code}' --resolve "$1.selftest.lan:80:127.0.0.1" "http://$1.selftest.lan$2"; }
+          docker exec smoke workstation-proxy sites
+          test -f /tmp/smoke/home/autostart-ran || { echo "autostart hook did not run"; exit 1; }
+          [ "$(get upstream /marker.txt)" = 200 ] || { echo "proxy to the autostarted upstream failed"; exit 1; }
+          [ "$(get hello /)" = 200 ] || { echo "static folder not served"; exit 1; }
+          [ "$(get hello /.env)" = 404 ] || { echo "dotfile was served"; exit 1; }
+          [ "$(get escape /passwd)" = 404 ] || { echo "rejected symlink was served"; exit 1; }
+          docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
+          start=$SECONDS
+          docker stop -t 120 smoke
+          took=$((SECONDS - start))
+          echo "stopped in ${took}s, exit code $(docker inspect -f '{{.State.ExitCode}}' smoke)"
+          docker logs smoke 2>&1 | grep 'workstation-supervise' | tail -n 5
+          test -f /tmp/smoke/home/shutdown-ran || { echo "shutdown hook did not run"; exit 1; }
+          [ "$(docker inspect -f '{{.State.ExitCode}}' smoke)" = 0 ] || { echo "unclean exit"; exit 1; }
+          [ "$took" -lt 100 ] || { echo "stop took too long"; exit 1; }
 
       - name: Publish
         if: needs.probe.outputs.publish == 'true'
