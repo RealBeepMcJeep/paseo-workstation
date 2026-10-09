@@ -3,7 +3,7 @@
 # line (also valid as Docker build args). CI hashes this output together with
 # the Dockerfile and rootfs: an unchanged hash means there is nothing to rebuild.
 #
-# Needs: curl, jq, npm. GitHub API calls use GH_TOKEN when it is set.
+# Needs: curl, jq, npm, git. GitHub API calls use GH_TOKEN when it is set.
 set -euo pipefail
 
 emit() {
@@ -42,6 +42,12 @@ image_digest() {
 node_repository=docker/library/node
 node_tag=22-trixie-slim
 node_digest=$(image_digest "$node_repository" "$node_tag")
+golang_repository=docker/library/golang
+golang_tag=1-trixie
+golang_digest=$(image_digest "$golang_repository" "$golang_tag")
+# The Cloudflare DNS module publishes git tags, not GitHub releases.
+caddy_cloudflare=$(git ls-remote --tags --refs https://github.com/caddy-dns/cloudflare.git \
+  | awk -F/ '{ print $3 }' | sort -V | tail -n 1)
 
 dotnet_index=$(curl -fsSL https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json)
 dotnet_sdk() { jq -er --arg c "$1" '."releases-index"[] | select(."channel-version" == $c) | ."latest-sdk"' <<<"$dotnet_index"; }
@@ -53,6 +59,7 @@ rust_stable=$(curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.t
 # (awk reads to the end: exiting early would make curl fail under pipefail.)
 
 emit NODE_IMAGE "public.ecr.aws/$node_repository:$node_tag@$node_digest"
+emit GOLANG_IMAGE "public.ecr.aws/$golang_repository:$golang_tag@$golang_digest"
 emit DEBIAN_REFRESH "$(date -u +%G-W%V)"
 emit RUST_STABLE "$rust_stable"
 emit DOTNET8_SDK "$(dotnet_sdk 8.0)"
@@ -73,6 +80,9 @@ gh_version=$(jq -er .tag_name <<<"$gh")
 emit GH_VERSION "$gh_version"
 emit GH_SHA256 "$(asset_sha256 "$gh" "gh_${gh_version#v}_linux_amd64.tar.gz")"
 emit TEA_VERSION "$(curl -fsSL https://gitea.com/api/v1/repos/gitea/tea/releases/latest | jq -er .tag_name)"
+emit CADDY_VERSION "$(github_latest caddyserver/caddy)"
+emit XCADDY_VERSION "$(github_latest caddyserver/xcaddy)"
+emit CADDY_CLOUDFLARE_VERSION "$caddy_cloudflare"
 emit PYRIGHT_VERSION "$(npm_latest pyright)"
 emit TS_LS_VERSION "$(npm_latest typescript-language-server)"
 emit TYPESCRIPT_VERSION "$(npm_latest typescript '^6')"

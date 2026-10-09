@@ -1,0 +1,464 @@
+#!/usr/bin/python3
+"""workstation-proxy: the optional Caddy subdomain proxy of the Paseo workstation.
+
+Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
+  PROXY_DOMAIN               public domain: <name>.<domain> over HTTPS with a
+                             Let's Encrypt wildcard via Cloudflare DNS-01
+  CLOUDFLARE_API_TOKEN       Cloudflare token (Zone DNS edit), or
+  CLOUDFLARE_API_TOKEN_FILE  a file holding it
+  PROXY_LAN_DOMAIN           local-only domain: http://<name>.<lan> and
+                             https://<name>.<lan> (Caddy's internal CA)
+  PROXY_BIND                 addresses to listen on, comma/space separated
+                             (default: all interfaces)
+  PROXY_CONFIG_DIR           project files (default /workspace/proxy):
+                             sites/<name>.caddy and www/<name>/
+  PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
+  PROXY_STATIC_ALLOWED       symlinks in www/ must point inside this (default /workspace)
+
+Commands:
+  check    build and validate the configuration without applying it
+  reload   rebuild, validate, and apply it; the running config stays on failure
+  sites    list published sites and skipped entries
+  status   show whether the proxy is disabled, running or failing
+  logs     show recent Caddy log lines (-n N)
+  ca       show where to get the internal CA root certificate
+  run      (used by the image's supervisor) build and run Caddy in the foreground
+"""
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/paseo"))
+STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "workstation-proxy"
+ACTIVE = STATE / "active"
+CANDIDATE = STATE / "candidate"
+LOG = STATE / "caddy.log"
+ERROR = STATE / "last-error.txt"
+REPORT = STATE / "report.json"
+CA_ROOT = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "caddy/pki/authorities/local/root.crt"
+TEMPLATE_README = Path("/usr/local/share/workstation-proxy/README.md")
+WORKSPACE = Path(os.environ.get("PROXY_STATIC_ALLOWED", "/workspace"))
+ADMIN = "localhost:2019"
+RESERVED = {"paseo", "sites"}
+NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+def env(name, default=""):
+    return os.environ.get(name, default).strip()
+
+
+def settings():
+    public = env("PROXY_DOMAIN").lower().rstrip(".")
+    lan = env("PROXY_LAN_DOMAIN").lower().rstrip(".")
+    problems = []
+    for label, value in (("PROXY_DOMAIN", public), ("PROXY_LAN_DOMAIN", lan)):
+        if value and not DOMAIN.match(value):
+            problems.append(f"{label} is not a valid domain name; ignored")
+    public = public if public and DOMAIN.match(public) else ""
+    lan = lan if lan and DOMAIN.match(lan) else ""
+    if public and not token():
+        problems.append("PROXY_DOMAIN is set but no CLOUDFLARE_API_TOKEN(_FILE): public HTTPS disabled")
+        public = ""
+    paseo_port = env("PASEO_LISTEN", "0.0.0.0:6767").rsplit(":", 1)[-1]
+    return {
+        "public": public,
+        "lan": lan,
+        "bind": [a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if a],
+        "http_port": env("PROXY_HTTP_PORT", "80"),
+        "https_port": env("PROXY_HTTPS_PORT", "443"),
+        "config": Path(env("PROXY_CONFIG_DIR", "/workspace/proxy")),
+        "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
+        "problems": problems,
+    }
+
+
+def enabled():
+    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN"))
+
+
+def token():
+    if env("CLOUDFLARE_API_TOKEN"):
+        return env("CLOUDFLARE_API_TOKEN")
+    path = env("CLOUDFLARE_API_TOKEN_FILE")
+    try:
+        return Path(path).read_text().strip() if path else ""
+    except OSError:
+        return ""
+
+
+def caddy_env():
+    """Environment for Caddy: the token is passed by variable, never written to config."""
+    environment = dict(os.environ)
+    if token():
+        environment["CLOUDFLARE_API_TOKEN"] = token()
+    return environment
+
+
+# ----- static folders --------------------------------------------------------
+
+def inside(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def check_static(entry):
+    """Return (resolved root, None) if www/<name> may be served, else (None, reason)."""
+    target = entry.resolve()
+    if not target.is_dir():
+        return None, "not a directory"
+    if entry.is_symlink():
+        if not inside(target, WORKSPACE) or inside(target, HOME):
+            return None, f"symlink points outside {WORKSPACE}"
+    checked = 0
+    for directory, dirnames, filenames in os.walk(target, followlinks=False):
+        for name in dirnames + filenames:
+            checked += 1
+            if checked > 50000:
+                return None, "too many files to check (over 50000)"
+            path = Path(directory) / name
+            if entry.is_symlink() and (name == ".git" or name.startswith(".env")):
+                return None, f"contains {path.relative_to(target)} (link only build output)"
+            if path.is_symlink() and not inside(path.resolve(), target):
+                return None, f"{path.relative_to(target)} links outside the folder"
+    return target, None
+
+
+def collect(cfg):
+    """Find site files and static folders; decide what is served and what is skipped."""
+    sites_dir, www_dir = cfg["config"] / "sites", cfg["config"] / "www"
+    sites, static, skipped = [], [], []
+    for path in sorted(sites_dir.glob("*.caddy")) if sites_dir.is_dir() else []:
+        name = path.stem
+        if name in RESERVED:
+            skipped.append({"name": name, "source": f"sites/{path.name}", "reason": "reserved name"})
+        else:
+            sites.append({"name": name, "source": f"sites/{path.name}", "path": str(path)})
+    taken = {s["name"] for s in sites} | RESERVED
+    for entry in sorted(www_dir.iterdir()) if www_dir.is_dir() else []:
+        name = entry.name
+        if name.startswith("."):
+            continue
+        if not NAME.match(name):
+            skipped.append({"name": name, "source": f"www/{name}", "reason": "invalid name (a-z, 0-9, -)"})
+        elif name in taken:
+            reason = "reserved name" if name in RESERVED else "a site file with this name takes precedence"
+            skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
+        else:
+            root, reason = check_static(entry)
+            if root:
+                static.append({"name": name, "source": f"www/{name}", "root": str(root)})
+            else:
+                skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
+    return sites, static, skipped
+
+
+# ----- configuration ---------------------------------------------------------
+
+def quote(value):
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def caddyfile(cfg, sites, static, include_sites=True):
+    public, lan = cfg["public"], cfg["lan"]
+    index = ACTIVE / "pages"
+    out = ["{", f"\tadmin {ADMIN}", "\tskip_install_trust", "\tgrace_period 10s",
+           f"\thttp_port {cfg['http_port']}", f"\thttps_port {cfg['https_port']}"]
+    if cfg["bind"]:
+        out.append("\tdefault_bind " + " ".join(cfg["bind"]))
+    if public:
+        out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+    out += ["\tlog default {", "\t\toutput stderr", "\t\tformat console", "\t}",
+            "\tlog file {", f"\t\toutput file {quote(LOG)} {{", "\t\t\troll_size 5MiB", "\t\t\troll_keep 3",
+            "\t\t}", "\t\tformat json", "\t}", "}", ""]
+
+    # (site NAME { directives }) gives NAME every configured address.
+    plain = [f"{{args[0]}}.{public}"] if public else []
+    plain += [f"http://{{args[0]}}.{lan}"] if lan else []
+    out.append("(site) {")
+    if plain:
+        out += ["\t" + ", ".join(plain) + " {", "\t\t{block}", "\t}"]
+    if lan:
+        out += [f"\thttps://{{args[0]}}.{lan} {{", "\t\ttls internal", "\t\t{block}", "\t}"]
+    out += ["}", "",
+            "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
+            "\t\treverse_proxy {args[1]}", "\t}", "}", "",
+            "# Static folders: dotfiles are never served.", "(static_files) {",
+            "\t@dotfiles path */.*", "\trespond @dotfiles 404", "\troot * {args[0]}",
+            "\tfile_server {", "\t\thide .*", "\t}", "}", ""]
+
+    # Reserved sites, the unknown-name page and public HTTP->HTTPS redirects.
+    out += ["import site paseo {", f"\treverse_proxy 127.0.0.1:{cfg['paseo_port']}", "}", "",
+            "import site sites {", "\thandle /root.crt {",
+            f"\t\troot * {quote(CA_ROOT.parent)}", "\t\trewrite * /root.crt", "\t\tfile_server", "\t}",
+            "\thandle {", f"\t\troot * {quote(index)}", "\t\tfile_server", "\t}", "}", ""]
+    unknown = ["\troot * " + quote(index), "\trewrite * /404.html", "\tfile_server {", "\t\tstatus 404", "\t}"]
+    if public:
+        out += [f"*.{public} {{"] + unknown + ["}", "",
+                f"http://*.{public} {{", "\tredir https://{host}{uri} permanent", "}", ""]
+    if lan:
+        out += [f"http://*.{lan} {{"] + unknown + ["}", "",
+                f"https://*.{lan} {{", "\ttls internal"] + unknown + ["}", ""]
+
+    for item in static:
+        out += [f"# {item['source']}", f"import site {item['name']} {{",
+                f"\timport static_files {quote(item['root'])}", "}", ""]
+    if include_sites:
+        for item in sites:
+            out += [f"# {item['source']}", f"import {quote(item['path'])}", ""]
+    return "\n".join(out) + "\n"
+
+
+def urls(cfg, name):
+    found = [f"https://{name}.{cfg['public']}"] if cfg["public"] else []
+    if cfg["lan"]:
+        found += [f"http://{name}.{cfg['lan']}", f"https://{name}.{cfg['lan']}"]
+    return found
+
+
+def pages(cfg, sites, static, skipped, degraded):
+    def listing(title):
+        rows = []
+        for kind, items in (("site", sites), ("static", static)):
+            for item in items:
+                if degraded and kind == "site":
+                    continue
+                links = " ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in urls(cfg, item["name"]))
+                rows.append(f"<tr><td>{html.escape(item['name'])}</td><td>{kind}</td><td>{links}</td></tr>")
+        skips = "".join(f"<li>{html.escape(s['source'])}: {html.escape(s['reason'])}</li>" for s in skipped)
+        ca = ('<p>Internal CA root for <code>https://*.' + html.escape(cfg["lan"]) +
+              '</code>: <a href="/root.crt">root.crt</a> (install it on a device to trust those names).</p>'
+              if cfg["lan"] else "")
+        note = "<p><strong>Site files are disabled: the configuration has an error. Run <code>workstation-proxy check</code>.</strong></p>" if degraded else ""
+        return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                f"<title>{html.escape(title)}</title><style>body{{font:15px system-ui;margin:2em;max-width:60em}}"
+                "td{padding:.2em 1em .2em 0}</style>"
+                f"<h1>{html.escape(title)}</h1>{note}<table>{''.join(rows) or '<tr><td>No sites yet.</td></tr>'}</table>"
+                f"{'<h2>Skipped</h2><ul>' + skips + '</ul>' if skips else ''}{ca}")
+    return {"index.html": listing("Sites"), "404.html": listing("Unknown site")}
+
+
+def build(target, cfg, include_sites=True):
+    """Write a complete configuration directory; return the report dict."""
+    sites, static, skipped = collect(cfg)
+    if target.exists():
+        shutil.rmtree(target)
+    (target / "pages").mkdir(parents=True)
+    text = caddyfile(cfg, sites, static, include_sites).replace(str(ACTIVE), str(target))
+    (target / "Caddyfile").write_text(text)
+    # Normalise formatting so Caddy does not warn about it on every start.
+    subprocess.run(["caddy", "fmt", "--overwrite", str(target / "Caddyfile")], capture_output=True)
+    for name, content in pages(cfg, sites, static, skipped, not include_sites).items():
+        (target / "pages" / name).write_text(content)
+    return {"public": cfg["public"], "lan": cfg["lan"], "bind": cfg["bind"], "degraded": not include_sites,
+            "problems": cfg["problems"], "sites": sites, "static": static, "skipped": skipped}
+
+
+def caddy(*args):
+    return subprocess.run(["caddy", *args], env=caddy_env(), capture_output=True, text=True)
+
+
+def validate(directory):
+    result = caddy("validate", "--config", str(directory / "Caddyfile"), "--adapter", "caddyfile")
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def promote(report):
+    """Replace the active configuration with the validated candidate."""
+    old = STATE / "previous"
+    if old.exists():
+        shutil.rmtree(old)
+    if ACTIVE.exists():
+        ACTIVE.rename(old)
+    CANDIDATE.rename(ACTIVE)
+    # Rewrite candidate paths to the active location.
+    caddy_file = ACTIVE / "Caddyfile"
+    caddy_file.write_text(caddy_file.read_text().replace(str(CANDIDATE), str(ACTIVE)))
+    REPORT.write_text(json.dumps(report, indent=2) + "\n")
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def prepare(cfg, strict):
+    """Build and validate a candidate; promote it. With strict=False, fall back to
+    a configuration without project site files when they make it invalid."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    for sub in ("sites", "www"):
+        (cfg["config"] / sub).mkdir(parents=True, exist_ok=True)
+    readme = cfg["config"] / "README.md"
+    if not readme.exists() and TEMPLATE_README.exists():
+        shutil.copy(TEMPLATE_README, readme)
+    report = build(CANDIDATE, cfg)
+    ok, message = validate(CANDIDATE)
+    if not ok and not strict:
+        report = build(CANDIDATE, cfg, include_sites=False)
+        degraded_ok, degraded_message = validate(CANDIDATE)
+        if degraded_ok:
+            ERROR.write_text(message + "\n")
+            promote(report)
+            return True, "site files disabled because the configuration is invalid:\n" + message
+        message = degraded_message
+    if not ok:
+        ERROR.write_text(message + "\n")
+        shutil.rmtree(CANDIDATE, ignore_errors=True)
+        return False, message
+    ERROR.unlink(missing_ok=True)
+    promote(report)
+    return True, ""
+
+
+def running():
+    try:
+        with urllib.request.urlopen(f"http://{ADMIN}/config/", timeout=2):
+            return True
+    except OSError:
+        return False
+
+
+# ----- commands --------------------------------------------------------------
+
+def require_enabled():
+    if not enabled():
+        print("workstation-proxy: disabled (set PROXY_DOMAIN and/or PROXY_LAN_DOMAIN to enable)")
+        sys.exit(0)
+
+
+def report_problems(cfg):
+    for problem in cfg["problems"]:
+        print(f"warning: {problem}")
+
+
+def cmd_check(_):
+    require_enabled()
+    cfg = settings()
+    report_problems(cfg)
+    STATE.mkdir(parents=True, exist_ok=True)
+    report = build(CANDIDATE, cfg)
+    ok, message = validate(CANDIDATE)
+    shutil.rmtree(CANDIDATE, ignore_errors=True)
+    for skip in report["skipped"]:
+        print(f"skipped {skip['source']}: {skip['reason']}")
+    print("configuration valid" if ok else "configuration INVALID:\n" + message)
+    return 0 if ok else 1
+
+
+def cmd_reload(_):
+    require_enabled()
+    cfg = settings()
+    report_problems(cfg)
+    ok, message = prepare(cfg, strict=True)
+    if not ok:
+        print("configuration INVALID; the running configuration is unchanged:\n" + message)
+        return 1
+    if running():
+        result = caddy("reload", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile",
+                       "--address", ADMIN)
+        if result.returncode != 0:
+            print("reload failed; Caddy keeps its previous configuration:\n" + result.stderr.strip())
+            return 1
+        print("reloaded")
+    else:
+        print("configuration updated; Caddy is not running yet (it starts with the container)")
+    for skip in json.loads(REPORT.read_text())["skipped"]:
+        print(f"skipped {skip['source']}: {skip['reason']}")
+    return 0
+
+
+def load_report():
+    try:
+        return json.loads(REPORT.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_sites(_):
+    require_enabled()
+    cfg, report = settings(), load_report()
+    if not report:
+        print("no configuration yet: run workstation-proxy reload")
+        return 1
+    for name in ("paseo", "sites"):
+        print(f"{name:20} reserved  {' '.join(urls(cfg, name))}")
+    for kind in ("sites", "static"):
+        for item in report[kind]:
+            state = " (disabled: config error)" if report["degraded"] and kind == "sites" else ""
+            print(f"{item['name']:20} {kind[:-1] if kind == 'sites' else 'static':9} {' '.join(urls(cfg, item['name']))}{state}")
+    for skip in report["skipped"]:
+        print(f"{skip['name']:20} skipped   {skip['source']}: {skip['reason']}")
+    return 0
+
+
+def cmd_status(_):
+    if not enabled():
+        print("disabled (set PROXY_DOMAIN and/or PROXY_LAN_DOMAIN to enable)")
+        return 0
+    cfg, report = settings(), load_report()
+    report_problems(cfg)
+    print(f"domains: public={cfg['public'] or '-'} lan={cfg['lan'] or '-'} bind={' '.join(cfg['bind']) or 'all'}")
+    print("caddy: running" if running() else "caddy: NOT running (see workstation-proxy logs)")
+    if report:
+        print(f"sites: {len(report['sites'])} site files, {len(report['static'])} static, {len(report['skipped'])} skipped")
+        if report["degraded"]:
+            print("DEGRADED: site files are disabled because the configuration is invalid")
+    if ERROR.exists():
+        print("last error:\n" + ERROR.read_text().strip())
+    return 0 if running() else 1
+
+
+def cmd_logs(args):
+    lines = int(args[args.index("-n") + 1]) if "-n" in args else 40
+    if not LOG.exists():
+        print("no log yet")
+        return 0
+    for line in LOG.read_text(errors="replace").splitlines()[-lines:]:
+        try:
+            entry = json.loads(line)
+            extra = {k: v for k, v in entry.items() if k not in ("ts", "level", "logger", "msg")}
+            print(f"{entry.get('level', '?'):5} {entry.get('logger', '')}: {entry.get('msg', '')} {json.dumps(extra) if extra else ''}")
+        except ValueError:
+            print(line)
+    return 0
+
+
+def cmd_ca(_):
+    require_enabled()
+    cfg = settings()
+    if not cfg["lan"]:
+        print("no internal CA in use (PROXY_LAN_DOMAIN is not set)")
+        return 0
+    print(f"download: https://sites.{cfg['public']}/root.crt" if cfg["public"] else f"download: http://sites.{cfg['lan']}/root.crt")
+    print(f"file: {CA_ROOT}" + ("" if CA_ROOT.exists() else " (created when Caddy first starts)"))
+    return 0
+
+
+def cmd_run(_):
+    require_enabled()
+    cfg = settings()
+    report_problems(cfg)
+    ok, message = prepare(cfg, strict=False)
+    if message:
+        print(f"workstation-proxy: WARNING: {message}", file=sys.stderr, flush=True)
+    if not ok:
+        print("workstation-proxy: no valid configuration; not starting Caddy", file=sys.stderr, flush=True)
+        return 1
+    os.execvpe("caddy", ["caddy", "run", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile"], caddy_env())
+
+
+COMMANDS = {"check": cmd_check, "reload": cmd_reload, "sites": cmd_sites, "status": cmd_status,
+            "logs": cmd_logs, "ca": cmd_ca, "run": cmd_run}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(__doc__.strip())
+        sys.exit(0 if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help", "help") else 2)
+    sys.exit(COMMANDS[sys.argv[1]](sys.argv[2:]))

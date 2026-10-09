@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2016  # checks run in child shells that expand exported variables
 # Functional self-test, run inside a started container:
 #   docker exec paseo workstation-selftest
 # CI runs it before publishing. It works in a scratch directory, never touches
@@ -59,7 +60,6 @@ check 'rust: native build' bash -c \
   'cargo new --lib --vcs none rs > /dev/null && cargo build --offline --manifest-path rs/Cargo.toml'
 check 'rust: wasm32 build' \
   cargo build --offline --manifest-path rs/Cargo.toml --target wasm32-unknown-unknown
-# shellcheck disable=SC2016  # expands inside the child bash
 check 'rust: std sources for rust-analyzer' bash -c \
   'test -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library"'
 
@@ -81,6 +81,34 @@ check 'typescript: tsc on a sample' bash -c \
   'printf "export const double = (value: number): number => value * 2;\n" > sample.ts && tsc --noEmit --strict sample.ts'
 check 'shell: shellcheck on a sample' bash -c \
   'printf "#!/bin/sh\necho \"ok\"\n" > sample.sh && shellcheck sample.sh'
+
+if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
+  # Requests go to the address Caddy listens on (first PROXY_BIND entry, else loopback).
+  bind="${PROXY_BIND:-127.0.0.1}"
+  read -r proxy_ip _ <<< "${bind//,/ }"
+  proxy_ip="${proxy_ip:-127.0.0.1}"
+  export proxy_ip
+  check 'proxy: running with a valid configuration' workstation-proxy status
+  if [ -n "${PROXY_LAN_DOMAIN:-}" ]; then
+    lan="$PROXY_LAN_DOMAIN"
+    export lan
+    check 'proxy: sites index over LAN HTTP' bash -c \
+      'curl -fsS --resolve "sites.$lan:${PROXY_HTTP_PORT:-80}:$proxy_ip" "http://sites.$lan:${PROXY_HTTP_PORT:-80}/" | grep -F "<h1>Sites</h1>"'
+    check 'proxy: Paseo UI through the proxy' bash -c \
+      'curl -fsS --resolve "paseo.$lan:${PROXY_HTTP_PORT:-80}:$proxy_ip" "http://paseo.$lan:${PROXY_HTTP_PORT:-80}/api/health"'
+    check 'proxy: unknown name returns the 404 page' bash -c \
+      'test "$(curl -s -o /dev/null -w "%{http_code}" --resolve "no-such-site.$lan:${PROXY_HTTP_PORT:-80}:$proxy_ip" "http://no-such-site.$lan:${PROXY_HTTP_PORT:-80}/")" = 404'
+    check 'proxy: LAN HTTPS verified with the internal CA root' bash -c '
+      curl -fsS -o ca.crt --resolve "sites.$lan:${PROXY_HTTP_PORT:-80}:$proxy_ip" "http://sites.$lan:${PROXY_HTTP_PORT:-80}/root.crt"
+      curl -fsS -o /dev/null --cacert ca.crt --resolve "sites.$lan:${PROXY_HTTPS_PORT:-443}:$proxy_ip" "https://sites.$lan:${PROXY_HTTPS_PORT:-443}/"'
+  fi
+  if [ -n "${PROXY_DOMAIN:-}" ]; then
+    public="$PROXY_DOMAIN"
+    export public
+    check 'proxy: public HTTPS with a trusted certificate' bash -c \
+      'curl -fsS -o /dev/null --resolve "sites.$public:${PROXY_HTTPS_PORT:-443}:$proxy_ip" "https://sites.$public:${PROXY_HTTPS_PORT:-443}/"'
+  fi
+fi
 
 if [ -r /sys/fs/cgroup/memory.current ]; then
   printf 'INFO memory: current %s, peak %s, limit %s\n' "$(cat /sys/fs/cgroup/memory.current)" \

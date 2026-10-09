@@ -21,6 +21,7 @@ Updating is meant to be just **Update** in Dockge.
 | TS/JS | Node 22, typescript-language-server, TypeScript 6 |
 | Language servers for Claude | pyright, csharp-ls, rust-analyzer, typescript-language-server, marksman (Markdown), yaml-language-server (with Compose and GitHub Actions schemas). Loaded from image-owned plugins in `/opt/claude-plugins` |
 | CLI tools | git, gh, tea (Gitea), jq, yq, ripgrep, fd, sqlite3, tree, shellcheck, ffmpeg, pdftotext, tmux, build-essential, cmake |
+| Proxy (optional, off by default) | Caddy with the Cloudflare DNS module: subdomains for projects, static folders, a sites index, and automatic HTTPS. See below |
 
 Exact versions of the running image are in `/etc/paseo-workstation/versions.txt`.
 
@@ -92,6 +93,41 @@ What startup manages (in `rootfs/usr/local/bin/workstation-start` and
 Startup problems never stop the container. Check
 `~/.paseo/workstation-startup-warnings.txt` and `~/.paseo/workstation-status.json`.
 
+## Lifecycle and hooks
+
+`tini` runs `workstation-start` (setup), which hands over to
+`workstation-supervise`. That process runs Paseo, the optional proxy and the
+optional hooks, and on Stop/Update shuts them down in order:
+
+1. `~/.config/workstation/shutdown` (if present and executable) runs first, with up
+   to 75 seconds, for example to stop project services cleanly.
+2. The proxy stops gracefully.
+3. Paseo stops gracefully.
+
+`~/.config/workstation/autostart` (if present and executable) runs once in the
+background after Paseo answers its health check, for example to start project
+services after an Update. Both hooks log to `~/.paseo/autostart.log`, rotated at
+1 MiB. Neither can block Paseo from starting. Compose allows 120 seconds for the
+whole stop.
+
+## Optional subdomain proxy
+
+Off unless at least one domain is set in the stack's environment:
+
+| Setting | Effect |
+|---|---|
+| `PROXY_DOMAIN=example.com` | `https://<name>.example.com` with a Let's Encrypt wildcard certificate, using Cloudflare DNS validation. Needs `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_API_TOKEN_FILE`) with DNS edit on that zone. Point a DNS-only `*` record at the container's address |
+| `PROXY_LAN_DOMAIN=home.lan` | `http://<name>.home.lan` and `https://<name>.home.lan` (Caddy's internal CA). Point a local DNS wildcard at the container |
+| `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
+| `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
+
+Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`)
+or drop static files in `www/<name>/`, then run `workstation-proxy reload`. The
+image seeds `README.md` into that folder with the details. `paseo.<domain>` serves
+the Paseo UI, and `sites.<domain>` lists every site and offers the internal CA root.
+Certificates and the CA live in `~/.local/share/caddy`. A broken project file never
+replaces a working configuration.
+
 ## Checking a deployment
 
 ```sh
@@ -100,8 +136,10 @@ docker exec paseo workstation-selftest
 
 This checks Paseo health, Chromium, the bladebro MCP handshake, Rust native and
 WASM builds, net8.0 and SDK-style net48 builds with an ilspycmd round trip,
-pyright/ruff, tsc and shellcheck, and reports memory use. It uses a scratch
-directory and needs no credentials.
+pyright/ruff, tsc and shellcheck, and reports memory use. When the proxy is
+enabled it also checks the sites index, the Paseo UI through the proxy, the 404
+page, and HTTPS on each configured domain. It uses a scratch directory and needs
+no credentials.
 
 ## Rollback
 
@@ -116,7 +154,8 @@ restore the home dataset snapshot while the stack is stopped.
 
 The repository and image are public and contain no credentials. Tokens come
 only from the Dockge environment at runtime: `PASEO_PASSWORD`, `GITEA_TOKEN`,
-`GH_TOKEN`, `MCPHUB_KEY`. Agent logins live in the home dataset.
+`GH_TOKEN`, `MCPHUB_KEY` and `CLOUDFLARE_API_TOKEN`. Agent logins and proxy
+certificates live in the home dataset.
 
 ## Changing the image
 

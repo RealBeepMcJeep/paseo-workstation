@@ -10,6 +10,21 @@
 # rebuilds only the last layers.
 
 ARG NODE_IMAGE=public.ecr.aws/docker/library/node:22-trixie-slim
+ARG GOLANG_IMAGE=public.ecr.aws/docker/library/golang:1-trixie
+
+# Caddy for the optional subdomain proxy (workstation-proxy), built with the
+# Cloudflare DNS module at exact versions. Go verifies every module download
+# against its checksum database (sum.golang.org).
+FROM ${GOLANG_IMAGE} AS caddy
+ARG CADDY_VERSION
+ARG XCADDY_VERSION
+ARG CADDY_CLOUDFLARE_VERSION
+RUN : "${CADDY_VERSION:?}" "${XCADDY_VERSION:?}" "${CADDY_CLOUDFLARE_VERSION:?}" \
+    && go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}" \
+    && CGO_ENABLED=0 xcaddy build "$CADDY_VERSION" \
+         --with "github.com/caddy-dns/cloudflare@${CADDY_CLOUDFLARE_VERSION}" \
+         --output /caddy
+
 FROM ${NODE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -187,10 +202,11 @@ RUN npm install -g --no-audit --no-fund \
          "@earendil-works/pi-coding-agent@$PI_VERSION" \
     && npm cache clean --force
 
+COPY --from=caddy /caddy /usr/local/bin/caddy
 COPY rootfs/ /
 # Belt and braces: the repo is edited on a dataset without exec bits, where Git
 # can record new scripts as 644.
-RUN chmod 755 /usr/local/bin/workstation-* /usr/local/bin/bladebro-mcp
+RUN chmod 755 /usr/local/bin/workstation-* /usr/local/bin/bladebro-mcp /usr/local/bin/caddy
 
 # Updates come from new images, not in-app updaters. CHROME_PATH and
 # BLADE_* configure bladebro for the image's Chromium; --no-sandbox because

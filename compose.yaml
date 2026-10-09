@@ -20,7 +20,8 @@ services:
     hostname: paseo
     user: "568:568"
     restart: unless-stopped
-    stop_grace_period: 60s
+    # Room for the optional shutdown hook (75s) plus proxy and Paseo shutdown.
+    stop_grace_period: 120s
     # Chromium uses /dev/shm.
     shm_size: 1gb
     environment:

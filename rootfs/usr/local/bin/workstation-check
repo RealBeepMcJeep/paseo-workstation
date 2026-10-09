@@ -61,6 +61,10 @@ version ts-ls           typescript-language-server --version
 version tsc             tsc --version
 version yaml-ls         node -p "require('$(npm root -g)/yaml-language-server/package.json').version"
 version marksman        marksman --version
+version caddy           caddy version
+modules="$(caddy list-modules)"
+require '^dns\.providers\.cloudflare$' "$modules" "Caddy Cloudflare DNS module"
+workstation-proxy --help > /dev/null
 
 version git             git --version
 version gh              gh --version
