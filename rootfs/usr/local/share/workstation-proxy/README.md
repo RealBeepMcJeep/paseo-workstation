@@ -58,6 +58,20 @@ import site api {
 A file can also contain plain Caddy site blocks for other names. Names under the
 public domain reuse its wildcard certificate.
 
+## Forward a raw TCP port (SSH, databases, ...)
+
+Create `tcp/<name>.caddy`:
+
+```caddy
+import forward 22 192.0.2.20:2222
+```
+
+Then run `workstation-proxy reload`. Port 22 on the proxy's addresses now
+forwards to `192.0.2.20:2222`. TCP has no hostname, so each port goes to exactly
+one destination, and every `*.example.com` name reaches it (for example
+`ssh git@code.example.com`). Any [caddy-l4](https://github.com/mholt/caddy-l4)
+route is allowed in these files.
+
 ## Commands
 
 | Command | What it does |

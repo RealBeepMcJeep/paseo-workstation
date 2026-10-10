@@ -64,6 +64,7 @@ version marksman        marksman --version
 version caddy           caddy version
 modules="$(caddy list-modules)"
 require '^dns\.providers\.cloudflare$' "$modules" "Caddy Cloudflare DNS module"
+require '^layer4$' "$modules" "Caddy layer4 module (TCP forwarding)"
 workstation-proxy --help > /dev/null
 
 version git             git --version

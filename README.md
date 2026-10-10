@@ -21,7 +21,7 @@ Updating is meant to be just **Update** in Dockge.
 | TS/JS | Node 22, typescript-language-server, TypeScript 6 |
 | Language servers for Claude | pyright, csharp-ls, rust-analyzer, typescript-language-server, marksman (Markdown), yaml-language-server (with Compose and GitHub Actions schemas). Loaded from image-owned plugins in `/opt/claude-plugins` |
 | CLI tools | git, gh, tea (Gitea), jq, yq, ripgrep, fd, sqlite3, tree, shellcheck, ffmpeg, pdftotext, tmux, build-essential, cmake |
-| Proxy (optional, off by default) | Caddy with the Cloudflare DNS module: subdomains for projects, static folders, a sites index, and automatic HTTPS. See below |
+| Proxy (optional, off by default) | Caddy with the Cloudflare DNS and caddy-l4 modules: subdomains for projects, static folders, TCP port forwards, a sites index, and automatic HTTPS. See below |
 
 Exact versions of the running image are in `/etc/paseo-workstation/versions.txt`.
 
@@ -121,8 +121,10 @@ Off unless at least one domain is set in the stack's environment:
 | `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
 | `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
 
-Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`)
-or drop static files in `www/<name>/`, then run `workstation-proxy reload`. The
+Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
+drop static files in `www/<name>/`, or forward a raw TCP port with
+`tcp/<name>.caddy` (for example `import forward 22 192.0.2.20:2222`, through the
+caddy-l4 plugin), then run `workstation-proxy reload`. The
 image seeds `README.md` into that folder with the details. `paseo.<domain>` serves
 the Paseo UI, and `sites.<domain>` lists every site and offers the internal CA root.
 Certificates and the CA live in `~/.local/share/caddy`. A broken project file never
