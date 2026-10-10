@@ -11,9 +11,11 @@ Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
   PROXY_BIND                 addresses to listen on, comma/space separated
                              (default: all interfaces)
   PROXY_CONFIG_DIR           project files (default /workspace/proxy):
-                             sites/<name>.caddy and www/<name>/
+                             sites/<name>.caddy, www/<name>/ and
+                             tcp/<name>.caddy (raw TCP forwards)
   PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
   PROXY_STATIC_ALLOWED       symlinks in www/ must point inside this (default /workspace)
+  PROXY_ADMIN                Caddy admin API address (default localhost:2019)
 
 Commands:
   check    build and validate the configuration without applying it
@@ -45,7 +47,7 @@ REPORT = STATE / "report.json"
 CA_ROOT = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "caddy/pki/authorities/local/root.crt"
 TEMPLATE_README = Path("/usr/local/share/workstation-proxy/README.md")
 WORKSPACE = Path(os.environ.get("PROXY_STATIC_ALLOWED", "/workspace"))
-ADMIN = "localhost:2019"
+ADMIN = os.environ.get("PROXY_ADMIN", "localhost:2019")  # Caddy admin API (loopback)
 RESERVED = {"paseo", "sites"}
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
@@ -160,7 +162,19 @@ def collect(cfg):
                 static.append({"name": name, "source": f"www/{name}", "root": str(root)})
             else:
                 skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
-    return sites, static, skipped
+    tcp_dir = cfg["config"] / "tcp"
+    tcp = [{"name": path.stem, "source": f"tcp/{path.name}", "path": str(path), "ports": forward_ports(path)}
+           for path in (sorted(tcp_dir.glob("*.caddy")) if tcp_dir.is_dir() else [])]
+    return sites, static, skipped, tcp
+
+
+def forward_ports(path):
+    """Ports named by `import forward PORT UPSTREAM` lines (for listings only)."""
+    try:
+        return [f"{m.group(1)} -> {m.group(2)}" for m in
+                re.finditer(r"^\s*import\s+forward\s+(\d+)\s+(\S+)", path.read_text(), re.M)]
+    except OSError:
+        return []
 
 
 # ----- configuration ---------------------------------------------------------
@@ -169,15 +183,25 @@ def quote(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def caddyfile(cfg, sites, static, include_sites=True):
+def caddyfile(cfg, sites, static, tcp, include_sites=True):
     public, lan = cfg["public"], cfg["lan"]
     index = ACTIVE / "pages"
-    out = ["{", f"\tadmin {ADMIN}", "\tskip_install_trust", "\tgrace_period 10s",
+    # (forward PORT UPSTREAM) for tcp/ files: raw TCP on every bind address.
+    # Snippets used inside global options must be defined before that block.
+    listen = [f"[{a}]" if ":" in a and not a.startswith("[") else a for a in cfg["bind"]] or [""]
+    out = ["# import forward PORT UPSTREAM (in tcp/*.caddy)", "(forward) {",
+           "\t" + " ".join(f"{a}:{{args[0]}}" for a in listen) + " {",
+           "\t\troute {", "\t\t\tproxy {args[1]}", "\t\t}", "\t}", "}", ""]
+    out += ["{", f"\tadmin {ADMIN}", "\tskip_install_trust", "\tgrace_period 10s",
            f"\thttp_port {cfg['http_port']}", f"\thttps_port {cfg['https_port']}"]
     if cfg["bind"]:
         out.append("\tdefault_bind " + " ".join(cfg["bind"]))
     if public:
         out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+    if include_sites and tcp:
+        out.append("\tlayer4 {")
+        out += [f"\t\timport {quote(item['path'])}" for item in tcp]
+        out.append("\t}")
     out += ["\tlog default {", "\t\toutput stderr", "\t\tformat console", "\t}",
             "\tlog file {", f"\t\toutput file {quote(LOG)} {{", "\t\t\troll_size 5MiB", "\t\t\troll_keep 3",
             "\t\t}", "\t\tformat json", "\t}", "}", ""]
@@ -226,7 +250,7 @@ def urls(cfg, name):
     return found
 
 
-def pages(cfg, sites, static, skipped, degraded):
+def pages(cfg, sites, static, skipped, tcp, degraded):
     def listing(title):
         rows = []
         for kind, items in (("site", sites), ("static", static)):
@@ -236,6 +260,8 @@ def pages(cfg, sites, static, skipped, degraded):
                 links = " ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in urls(cfg, item["name"]))
                 rows.append(f"<tr><td>{html.escape(item['name'])}</td><td>{kind}</td><td>{links}</td></tr>")
         skips = "".join(f"<li>{html.escape(s['source'])}: {html.escape(s['reason'])}</li>" for s in skipped)
+        forwards = "" if degraded else "".join(
+            f"<li>{html.escape(t['name'])}: {html.escape(', '.join(t['ports']) or 'custom rule')}</li>" for t in tcp)
         ca = ('<p>Internal CA root for <code>https://*.' + html.escape(cfg["lan"]) +
               '</code>: <a href="/root.crt">root.crt</a> (install it on a device to trust those names).</p>'
               if cfg["lan"] else "")
@@ -244,24 +270,25 @@ def pages(cfg, sites, static, skipped, degraded):
                 f"<title>{html.escape(title)}</title><style>body{{font:15px system-ui;margin:2em;max-width:60em}}"
                 "td{padding:.2em 1em .2em 0}</style>"
                 f"<h1>{html.escape(title)}</h1>{note}<table>{''.join(rows) or '<tr><td>No sites yet.</td></tr>'}</table>"
+                f"{'<h2>TCP forwards</h2><ul>' + forwards + '</ul>' if forwards else ''}"
                 f"{'<h2>Skipped</h2><ul>' + skips + '</ul>' if skips else ''}{ca}")
     return {"index.html": listing("Sites"), "404.html": listing("Unknown site")}
 
 
 def build(target, cfg, include_sites=True):
     """Write a complete configuration directory; return the report dict."""
-    sites, static, skipped = collect(cfg)
+    sites, static, skipped, tcp = collect(cfg)
     if target.exists():
         shutil.rmtree(target)
     (target / "pages").mkdir(parents=True)
-    text = caddyfile(cfg, sites, static, include_sites).replace(str(ACTIVE), str(target))
+    text = caddyfile(cfg, sites, static, tcp, include_sites).replace(str(ACTIVE), str(target))
     (target / "Caddyfile").write_text(text)
     # Normalise formatting so Caddy does not warn about it on every start.
     subprocess.run(["caddy", "fmt", "--overwrite", str(target / "Caddyfile")], capture_output=True)
-    for name, content in pages(cfg, sites, static, skipped, not include_sites).items():
+    for name, content in pages(cfg, sites, static, skipped, tcp, not include_sites).items():
         (target / "pages" / name).write_text(content)
     return {"public": cfg["public"], "lan": cfg["lan"], "bind": cfg["bind"], "degraded": not include_sites,
-            "problems": cfg["problems"], "sites": sites, "static": static, "skipped": skipped}
+            "problems": cfg["problems"], "sites": sites, "static": static, "skipped": skipped, "tcp": tcp}
 
 
 def caddy(*args):
@@ -293,7 +320,7 @@ def prepare(cfg, strict):
     """Build and validate a candidate; promote it. With strict=False, fall back to
     a configuration without project site files when they make it invalid."""
     STATE.mkdir(parents=True, exist_ok=True)
-    for sub in ("sites", "www"):
+    for sub in ("sites", "www", "tcp"):
         (cfg["config"] / sub).mkdir(parents=True, exist_ok=True)
     readme = cfg["config"] / "README.md"
     if not readme.exists() and TEMPLATE_README.exists():
@@ -393,6 +420,9 @@ def cmd_sites(_):
         for item in report[kind]:
             state = " (disabled: config error)" if report["degraded"] and kind == "sites" else ""
             print(f"{item['name']:20} {kind[:-1] if kind == 'sites' else 'static':9} {' '.join(urls(cfg, item['name']))}{state}")
+    for item in report.get("tcp", []):
+        state = " (disabled: config error)" if report["degraded"] else ""
+        print(f"{item['name']:20} tcp       {', '.join(item['ports']) or item['source']}{state}")
     for skip in report["skipped"]:
         print(f"{skip['name']:20} skipped   {skip['source']}: {skip['reason']}")
     return 0
@@ -407,9 +437,10 @@ def cmd_status(_):
     print(f"domains: public={cfg['public'] or '-'} lan={cfg['lan'] or '-'} bind={' '.join(cfg['bind']) or 'all'}")
     print("caddy: running" if running() else "caddy: NOT running (see workstation-proxy logs)")
     if report:
-        print(f"sites: {len(report['sites'])} site files, {len(report['static'])} static, {len(report['skipped'])} skipped")
+        print(f"sites: {len(report['sites'])} site files, {len(report['static'])} static, "
+              f"{len(report.get('tcp', []))} tcp forwards, {len(report['skipped'])} skipped")
         if report["degraded"]:
-            print("DEGRADED: site files are disabled because the configuration is invalid")
+            print("DEGRADED: site files and tcp forwards are disabled because the configuration is invalid")
     if ERROR.exists():
         print("last error:\n" + ERROR.read_text().strip())
     return 0 if running() else 1

@@ -189,6 +189,8 @@ jobs:
           EOF
           chmod 755 /tmp/smoke/home/.config/workstation/*
           echo 'import proxy upstream 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
+          mkdir -p /tmp/smoke/workspace/proxy/tcp
+          echo 'import forward 18080 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/tcp/echo.caddy
           echo '<p>hello static</p>' > /tmp/smoke/workspace/proxy/www/hello/index.html
           echo 'SECRET=1' > /tmp/smoke/workspace/proxy/www/hello/.env
           ln -s /etc /tmp/smoke/workspace/proxy/www/escape
@@ -226,6 +228,9 @@ jobs:
           test -f /tmp/smoke/home/autostart-ran || { echo "::error::autostart hook did not run"; exit 1; }
           trap 'docker logs smoke 2>&1 | tail -n 30 | sed "s/^/  /"' ERR
           [ "$(get upstream /marker.txt)" = 200 ] || { echo "::error::proxy to the autostarted upstream failed"; exit 1; }
+          [ "$(docker exec smoke curl -s -m 5 http://127.0.0.1:18080/marker.txt)" = upstream-ok ] \
+            || { echo "::error::TCP forward to the autostarted upstream failed"; exit 1; }
+          docker exec smoke workstation-proxy sites | grep -E '^echo +tcp'
           [ "$(get hello /)" = 200 ] || { echo "::error::static folder not served"; exit 1; }
           [ "$(get hello /.env)" = 404 ] || { echo "::error::dotfile was served"; exit 1; }
           [ "$(get escape /passwd)" = 404 ] || { echo "::error::rejected symlink was served"; exit 1; }
