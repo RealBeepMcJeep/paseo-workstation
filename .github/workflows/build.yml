@@ -188,16 +188,17 @@ jobs:
           touch "$HOME/shutdown-ran"
           EOF
           chmod 755 /tmp/smoke/home/.config/workstation/*
-          echo 'import proxy upstream 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
+          printf '# check: /marker.txt\nimport proxy upstream 127.0.0.1:18999\n' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
+          printf '# check: /\nimport proxy down 127.0.0.1:1\n' > /tmp/smoke/workspace/proxy/sites/down.caddy
           echo 'import proxy hello.demo 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/hello.demo.caddy
           mkdir -p /tmp/smoke/workspace/proxy/tcp
-          echo 'import forward 18080 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/tcp/echo.caddy
+          printf '# check: tcp\nimport forward 18080 127.0.0.1:18999\n' > /tmp/smoke/workspace/proxy/tcp/echo.caddy
           echo '<p>hello static</p>' > /tmp/smoke/workspace/proxy/www/hello/index.html
           echo 'SECRET=1' > /tmp/smoke/workspace/proxy/www/hello/.env
           ln -s /etc /tmp/smoke/workspace/proxy/www/escape
           sudo chown -R 568:568 /tmp/smoke
           docker run -d --name smoke --user 568:568 --shm-size 1g --security-opt no-new-privileges:true \
-            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_LAN_DOMAIN=selftest.lan \
+            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_LAN_DOMAIN=selftest.lan -e PROXY_CHECK_INTERVAL=60 \
             -v /tmp/smoke/home:/home/paseo -v /tmp/smoke/workspace:/workspace \
             "$IMAGE:latest"
           for _ in $(seq 1 60); do
@@ -243,6 +244,22 @@ jobs:
           [ "$(get hello /.env)" = 404 ] || { echo "::error::dotfile was served"; exit 1; }
           [ "$(get escape /passwd)" = 404 ] || { echo "::error::rejected symlink was served"; exit 1; }
           docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
+          # Status checks: up, down, none (no check line) and the implicit static check.
+          # (Interval 60s: a result from before the upstream started is retried within it.)
+          for _ in $(seq 1 45); do
+            checks=$(docker exec smoke workstation-proxy checks)
+            grep -Eq '^up +site +upstream' <<< "$checks" && break
+            sleep 2
+          done
+          echo "$checks"
+          grep -Eq '^up +site +upstream ' <<< "$checks" || { echo "::error::upstream status check is not up"; exit 1; }
+          grep -Eq '^down +site +down ' <<< "$checks" || { echo "::error::down status check is not down"; exit 1; }
+          grep -Eq '^none +site +hello.demo ' <<< "$checks" || { echo "::error::site without a check is not none"; exit 1; }
+          grep -Eq '^up +static +hello ' <<< "$checks" || { echo "::error::static folder check is not up"; exit 1; }
+          grep -Eq '^up +tcp +echo ' <<< "$checks" || { echo "::error::tcp status check is not up"; exit 1; }
+          docker exec smoke curl -fsS --resolve sites.selftest.lan:80:127.0.0.1 http://sites.selftest.lan/status.json \
+            | jq -e '.checks["site:upstream"].state == "up"' > /dev/null \
+            || { echo "::error::status.json is not served on the sites page"; exit 1; }
           start=$SECONDS
           docker stop -t 120 smoke
           took=$((SECONDS - start))

@@ -21,7 +21,7 @@ Updating is meant to be just **Update** in Dockge.
 | TS/JS | Node 22, typescript-language-server, TypeScript 6 |
 | Language servers for Claude | pyright, csharp-ls, rust-analyzer, typescript-language-server, marksman (Markdown), yaml-language-server (with Compose and GitHub Actions schemas). Loaded from image-owned plugins in `/opt/claude-plugins` |
 | CLI tools | git, gh, tea (Gitea), jq, yq, ripgrep, fd, sqlite3, tree, shellcheck, ffmpeg, pdftotext, tmux, build-essential, cmake |
-| Proxy (optional, off by default) | Caddy with the Cloudflare DNS and caddy-l4 modules: subdomains for projects, static folders, TCP port forwards, a sites index, and automatic HTTPS. See below |
+| Proxy (optional, off by default) | Caddy with the Cloudflare DNS and caddy-l4 modules: subdomains for projects, static folders, TCP port forwards, a sites index with status checks, and automatic HTTPS. See below |
 
 Exact versions of the running image are in `/etc/paseo-workstation/versions.txt`.
 
@@ -121,6 +121,7 @@ Off unless at least one domain is set in the stack's environment:
 | `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
 | `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
 | `PROXY_MANAGE_DNS=true` | For each `<service>.<host>` site, create the Cloudflare record `*.<host>.example.com` → `PROXY_DNS_TARGET` (default: first `PROXY_BIND`) if it's missing. Create-only: never edits or deletes records |
+| `PROXY_CHECK_INTERVAL=300` | Seconds between status checks of one site (minimum 60). Checks are `# check:` lines in site files; results are dots on the sites page |
 
 Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
 drop static files in `www/<name>/`, or forward a raw TCP port with
