@@ -189,6 +189,7 @@ jobs:
           EOF
           chmod 755 /tmp/smoke/home/.config/workstation/*
           echo 'import proxy upstream 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
+          echo 'import proxy hello.demo 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/hello.demo.caddy
           mkdir -p /tmp/smoke/workspace/proxy/tcp
           echo 'import forward 18080 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/tcp/echo.caddy
           echo '<p>hello static</p>' > /tmp/smoke/workspace/proxy/www/hello/index.html
@@ -231,6 +232,13 @@ jobs:
           [ "$(docker exec smoke curl -s -m 5 http://127.0.0.1:18080/marker.txt)" = upstream-ok ] \
             || { echo "::error::TCP forward to the autostarted upstream failed"; exit 1; }
           docker exec smoke workstation-proxy sites | grep -E '^echo +tcp'
+          # <service>.<host> sites: the site works, unknown services on that host get the
+          # 404 page, and a public domain would get one wildcard certificate per host.
+          [ "$(get hello.demo /marker.txt)" = 200 ] || { echo "::error::<service>.<host> site failed"; exit 1; }
+          [ "$(get nothing.demo /)" = 404 ] || { echo "::error::unknown service on a host did not 404"; exit 1; }
+          docker exec -e PROXY_DOMAIN=example.com -e CLOUDFLARE_API_TOKEN=ci-dummy -e XDG_STATE_HOME=/tmp/ci-show \
+            smoke workstation-proxy show | grep -F '*.demo.example.com {' \
+            || { echo "::error::no per-host wildcard block in the generated config"; exit 1; }
           [ "$(get hello /)" = 200 ] || { echo "::error::static folder not served"; exit 1; }
           [ "$(get hello /.env)" = 404 ] || { echo "::error::dotfile was served"; exit 1; }
           [ "$(get escape /passwd)" = 404 ] || { echo "::error::rejected symlink was served"; exit 1; }

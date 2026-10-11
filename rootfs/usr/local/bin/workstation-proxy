@@ -16,9 +16,17 @@ Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
   PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
   PROXY_STATIC_ALLOWED       symlinks in www/ must point inside this (default /workspace)
   PROXY_ADMIN                Caddy admin API address (default localhost:2019)
+  PROXY_MANAGE_DNS           true: for every <service>.<host> site file, make sure a
+                             Cloudflare record *.<host>.<domain> -> PROXY_DNS_TARGET
+                             exists (create-only; never edits or deletes records)
+  PROXY_DNS_TARGET           address for those records (default: first PROXY_BIND)
+
+Site files named <service>.<host>.caddy also get one wildcard certificate per host
+(*.<host>.<domain>), so further services on that host need no new certificate.
 
 Commands:
   check    build and validate the configuration without applying it
+  show     print the generated Caddy configuration (no secrets)
   reload   rebuild, validate, and apply it; the running config stays on failure
   sites    list published sites and skipped entries
   status   show whether the proxy is disabled, running or failing
@@ -34,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -78,6 +87,9 @@ def settings():
         "https_port": env("PROXY_HTTPS_PORT", "443"),
         "config": Path(env("PROXY_CONFIG_DIR", "/workspace/proxy")),
         "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
+        "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
+        "dns_target": env("PROXY_DNS_TARGET") or next(
+            (a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if re.fullmatch(r"[0-9.]+", a)), ""),
         "problems": problems,
     }
 
@@ -177,6 +189,55 @@ def forward_ports(path):
         return []
 
 
+def hosts(sites):
+    """Hosts named by <service>.<host> site files, e.g. dockge.truenas -> truenas."""
+    found = {item["name"].split(".", 1)[1] for item in sites if "." in item["name"]}
+    return sorted(h for h in found if DOMAIN.match(h))
+
+
+def cloudflare(method, path, data=None):
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
+                                 data=json.dumps(data).encode() if data is not None else None,
+                                 headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        return json.load(error)
+
+
+def ensure_dns(cfg, names):
+    """Create missing *.<host>.<domain> A records. Create-only; returns per-host results."""
+    if not (cfg["manage_dns"] and cfg["public"] and names):
+        return []
+    if not cfg["dns_target"]:
+        return [{"name": "*", "state": "error: set PROXY_DNS_TARGET (or an IPv4 PROXY_BIND)"}]
+    results, zone, labels = [], None, cfg["public"].split(".")
+    try:
+        for i in range(len(labels) - 1):  # the zone may be a parent of PROXY_DOMAIN
+            found = cloudflare("GET", "/zones?name=" + ".".join(labels[i:])).get("result") or []
+            if found:
+                zone = found[0]["id"]
+                break
+        if not zone:
+            return [{"name": "*", "state": f"error: no Cloudflare zone found for {cfg['public']}"}]
+        for host in names:
+            fqdn = f"*.{host}.{cfg['public']}"
+            existing = cloudflare("GET", f"/zones/{zone}/dns_records?name={fqdn}").get("result") or []
+            if existing:
+                results.append({"name": fqdn, "state": "exists"})
+                continue
+            made = cloudflare("POST", f"/zones/{zone}/dns_records", {
+                "type": "A", "name": fqdn, "content": cfg["dns_target"], "proxied": False, "ttl": 1,
+                "comment": f"workstation-proxy: services on {host} (<service>.{host}.{cfg['public']})"})
+            state = "created" if made.get("success") else "error: " + "; ".join(
+                e.get("message", "?") for e in made.get("errors", []))
+            results.append({"name": fqdn, "state": state})
+    except (OSError, ValueError) as error:
+        results.append({"name": "*", "state": f"error: {type(error).__name__}"})
+    return results
+
+
 # ----- configuration ---------------------------------------------------------
 
 def quote(value):
@@ -233,6 +294,15 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
     if lan:
         out += [f"http://*.{lan} {{"] + unknown + ["}", "",
                 f"https://*.{lan} {{", "\ttls internal"] + unknown + ["}", ""]
+    # One wildcard per host of <service>.<host> sites: a single certificate covers
+    # every service on that host (Caddy 2.10+ prefers an applicable wildcard).
+    for host in (hosts(sites) if include_sites else []):
+        if public:
+            out += [f"*.{host}.{public} {{"] + unknown + ["}", "",
+                    f"http://*.{host}.{public} {{", "\tredir https://{host}{uri} permanent", "}", ""]
+        if lan:
+            out += [f"http://*.{host}.{lan} {{"] + unknown + ["}", "",
+                    f"https://*.{host}.{lan} {{", "\ttls internal"] + unknown + ["}", ""]
 
     for item in static:
         out += [f"# {item['source']}", f"import site {item['name']} {{",
@@ -326,12 +396,19 @@ def prepare(cfg, strict):
     if not readme.exists() and TEMPLATE_README.exists():
         shutil.copy(TEMPLATE_README, readme)
     report = build(CANDIDATE, cfg)
+    dns = ensure_dns(cfg, hosts(report["sites"]))
+    for item in dns:
+        if item["state"].startswith("error"):
+            print(f"workstation-proxy: WARNING: DNS {item['name']}: {item['state']}", file=sys.stderr, flush=True)
+        elif item["state"] == "created":
+            print(f"workstation-proxy: created DNS record {item['name']} -> {cfg['dns_target']}", flush=True)
     ok, message = validate(CANDIDATE)
     if not ok and not strict:
         report = build(CANDIDATE, cfg, include_sites=False)
         degraded_ok, degraded_message = validate(CANDIDATE)
         if degraded_ok:
             ERROR.write_text(message + "\n")
+            report["dns"] = dns
             promote(report)
             return True, "site files disabled because the configuration is invalid:\n" + message
         message = degraded_message
@@ -340,6 +417,7 @@ def prepare(cfg, strict):
         shutil.rmtree(CANDIDATE, ignore_errors=True)
         return False, message
     ERROR.unlink(missing_ok=True)
+    report["dns"] = dns
     promote(report)
     return True, ""
 
@@ -388,6 +466,8 @@ def cmd_reload(_):
         print("configuration INVALID; the running configuration is unchanged:\n" + message)
         return 1
     if running():
+        print("applying (if new names need certificates, this can take a few minutes; sites keep serving)",
+              flush=True)
         result = caddy("reload", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile",
                        "--address", ADMIN)
         if result.returncode != 0:
@@ -435,6 +515,9 @@ def cmd_status(_):
     cfg, report = settings(), load_report()
     report_problems(cfg)
     print(f"domains: public={cfg['public'] or '-'} lan={cfg['lan'] or '-'} bind={' '.join(cfg['bind']) or 'all'}")
+    if cfg["manage_dns"]:
+        dns = (report or {}).get("dns", [])
+        print("dns: managed (" + (", ".join(f"{d['name']} {d['state']}" for d in dns) or "no <service>.<host> sites yet") + ")")
     print("caddy: running" if running() else "caddy: NOT running (see workstation-proxy logs)")
     if report:
         print(f"sites: {len(report['sites'])} site files, {len(report['static'])} static, "
@@ -458,6 +541,16 @@ def cmd_logs(args):
             print(f"{entry.get('level', '?'):5} {entry.get('logger', '')}: {entry.get('msg', '')} {json.dumps(extra) if extra else ''}")
         except ValueError:
             print(line)
+    return 0
+
+
+def cmd_show(_):
+    require_enabled()
+    cfg = settings()
+    STATE.mkdir(parents=True, exist_ok=True)
+    build(CANDIDATE, cfg)
+    print((CANDIDATE / "Caddyfile").read_text(), end="")
+    shutil.rmtree(CANDIDATE, ignore_errors=True)
     return 0
 
 
@@ -485,7 +578,7 @@ def cmd_run(_):
     os.execvpe("caddy", ["caddy", "run", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile"], caddy_env())
 
 
-COMMANDS = {"check": cmd_check, "reload": cmd_reload, "sites": cmd_sites, "status": cmd_status,
+COMMANDS = {"check": cmd_check, "show": cmd_show, "reload": cmd_reload, "sites": cmd_sites, "status": cmd_status,
             "logs": cmd_logs, "ca": cmd_ca, "run": cmd_run}
 
 if __name__ == "__main__":
