@@ -120,6 +120,7 @@ Off unless at least one domain is set in the stack's environment:
 | `PROXY_LAN_DOMAIN=home.lan` | `http://<name>.home.lan` and `https://<name>.home.lan` (Caddy's internal CA). Point a local DNS wildcard at the container |
 | `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
 | `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
+| `PROXY_MANAGE_DNS=true` | For each `<service>.<host>` site, create the Cloudflare record `*.<host>.example.com` → `PROXY_DNS_TARGET` (default: first `PROXY_BIND`) if it's missing. Create-only: never edits or deletes records |
 
 Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
 drop static files in `www/<name>/`, or forward a raw TCP port with
@@ -127,7 +128,10 @@ drop static files in `www/<name>/`, or forward a raw TCP port with
 caddy-l4 plugin), then run `workstation-proxy reload`. The
 image seeds `README.md` into that folder with the details. `paseo.<domain>` serves
 the Paseo UI, and `sites.<domain>` lists every site and offers the internal CA root.
-Certificates and the CA live in `~/.local/share/caddy`. A broken project file never
+Site files named `<service>.<host>.caddy` (e.g. `dockge.nas.caddy` →
+`https://dockge.nas.example.com`) share one wildcard certificate per host
+(`*.nas.example.com`). Only the first service on a new host waits for a
+certificate. Certificates and the CA live in `~/.local/share/caddy`. A broken project file never
 replaces a working configuration.
 
 ## Checking a deployment

@@ -13,7 +13,7 @@
 # GITEA_USER, GITEA_TOKEN;
 # optional MCPHUB_KEY (MCPHub "paseo" group), GH_TOKEN, GIT_USER_NAME,
 # GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG, and for the proxy
-# PROXY_DOMAIN, PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN.
+# PROXY_DOMAIN, PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN, PROXY_MANAGE_DNS.
 services:
   paseo:
     image: ghcr.io/realbeepmcjeep/paseo-workstation:${PASEO_IMAGE_TAG:-latest}
@@ -44,6 +44,8 @@ services:
       PROXY_LAN_DOMAIN: ${PROXY_LAN_DOMAIN:-}
       PROXY_BIND: ${PROXY_BIND:-}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # true: create missing *.<host> DNS records for <service>.<host> sites.
+      PROXY_MANAGE_DNS: ${PROXY_MANAGE_DNS:-}
     volumes:
       - type: bind
         source: /mnt/tank3/apps/paseo/home

@@ -24,6 +24,20 @@ Then run `workstation-proxy reload`. The app is now at:
 
 The file name is the name shown on the index page. Names use `a-z`, `0-9` and `-`.
 
+## Services on other machines: `<service>.<host>`
+
+Name the file `sites/<service>.<host>.caddy`, e.g. `sites/dockge.nas.caddy`:
+
+```caddy
+import proxy dockge.nas 192.0.2.20:5001
+```
+
+This gives `https://dockge.nas.example.com`. All services on one host share one wildcard
+certificate (`*.nas.example.com`), so only the first service on a new host waits a
+few minutes for it (`reload` says so). If the host has its own DNS record
+(`nas.example.com` → its IP), it also needs a `*.nas.example.com` record pointing
+at the proxy. With `PROXY_MANAGE_DNS=true` the proxy creates that record itself.
+
 ## Publish static files without running a server
 
 Put the files in `www/<name>/`, or symlink a build output folder there:
@@ -77,6 +91,7 @@ route is allowed in these files.
 | Command | What it does |
 |---|---|
 | `workstation-proxy check` | Validate without applying; lists skipped entries |
+| `workstation-proxy show` | Print the generated Caddy configuration (no secrets) |
 | `workstation-proxy reload` | Rebuild and apply. **Run it after every edit.** If the configuration is invalid, the running one stays |
 | `workstation-proxy sites` | List published sites, their URLs and skipped entries |
 | `workstation-proxy status` | Running or failing, plus the last error |
