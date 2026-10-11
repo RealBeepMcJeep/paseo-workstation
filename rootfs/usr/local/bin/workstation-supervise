@@ -1,6 +1,7 @@
 #!/bin/bash
 # Lifecycle owner, started by workstation-start under tini. It runs Paseo, the
-# optional Caddy proxy (workstation-proxy) and the optional autostart hook. On
+# optional Caddy proxy (workstation-proxy) with its status checks, and the
+# optional autostart hook. On
 # Stop/Update (SIGTERM) it runs the optional shutdown hook, then stops the proxy
 # and Paseo cleanly, all within compose's stop_grace_period (120s).
 #
@@ -16,6 +17,7 @@ hook_log="$PASEO_HOME/autostart.log"
 paseo_port="${PASEO_LISTEN##*:}"
 stopping=0
 proxy_pid=""
+checks_pid=""
 autostart_pid=""
 trap 'stopping=1' TERM INT
 
@@ -55,6 +57,19 @@ proxy_loop() {
   done
 }
 
+checks_loop() {
+  # Every minute, run the status checks that are due. workstation-proxy limits each
+  # entry to one check per PROXY_CHECK_INTERVAL and never runs two at once.
+  trap 'exit 0' TERM
+  sleep 20 &
+  wait $!
+  while :; do
+    workstation-proxy checks --quiet > /dev/null
+    sleep 60 &
+    wait $!
+  done
+}
+
 if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
   # Let Paseo accept its web UI through the proxy at paseo.<domain>.
   for domain in ${PROXY_DOMAIN:-} ${PROXY_LAN_DOMAIN:-}; do
@@ -69,6 +84,8 @@ paseo_pid=$!
 if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
   proxy_loop &
   proxy_pid=$!
+  checks_loop &
+  checks_pid=$!
 fi
 
 if [ -x "$hooks/autostart" ]; then
@@ -96,6 +113,7 @@ fi
 
 say "stopping"
 [ -n "$autostart_pid" ] && kill -TERM "$autostart_pid" 2> /dev/null
+[ -n "$checks_pid" ] && kill -TERM "$checks_pid" 2> /dev/null
 run_hook shutdown 75
 if [ -n "$proxy_pid" ]; then
   kill -TERM "$proxy_pid" 2> /dev/null

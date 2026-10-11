@@ -86,6 +86,32 @@ one destination, and every `*.example.com` name reaches it (for example
 `ssh git@code.example.com`). Any [caddy-l4](https://github.com/mholt/caddy-l4)
 route is allowed in these files.
 
+## Status checks
+
+The sites page shows a dot per entry: green up, yellow checking or unsure, red down,
+black no check. Define a check with one `# check:` line in the same file:
+
+```caddy
+# check: /health
+import proxy myapp 127.0.0.1:5173
+```
+
+| Line | Up when |
+|---|---|
+| `# check: /path` | The path answers 200-399 through the proxy's own address (name, certificate, proxy and app) |
+| `# check: /path 200,401` | The status is one of these (`2xx` and `200-299` work too) |
+| `# check: https://host/path` | That URL answers 200-399 |
+| `# check: tcp` | The file's upstream accepts TCP connections (or `tcp host:port`) |
+| `# check: run <command>` | The command exits 0. Exit 1 is down, anything else unsure; its first output line is the note. `CHECK_NAME` and `CHECK_URL` are set |
+
+Red: no answer, a 5xx status, or exit 1. Yellow: another status, a certificate problem,
+not checked yet, or results too old (the checker isn't running). Each check has 10
+seconds. `www/` folders count as up while the folder exists.
+
+Checks run in the background: each entry at most every `PROXY_CHECK_INTERVAL` seconds
+(default 300), and never two runs at once. `workstation-proxy checks` runs what's due
+and lists every state. Edit a check line, then `reload`, like any other change.
+
 ## Commands
 
 | Command | What it does |
@@ -96,6 +122,7 @@ route is allowed in these files.
 | `workstation-proxy sites` | List published sites, their URLs and skipped entries |
 | `workstation-proxy status` | Running or failing, plus the last error |
 | `workstation-proxy logs [-n N]` | Recent Caddy log lines |
+| `workstation-proxy checks` | Run the status checks that are due, then list every state |
 | `workstation-proxy ca` | Where to get the internal CA root certificate |
 
 ## Reserved and automatic

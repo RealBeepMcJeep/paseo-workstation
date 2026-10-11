@@ -20,9 +20,17 @@ Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
                              Cloudflare record *.<host>.<domain> -> PROXY_DNS_TARGET
                              exists (create-only; never edits or deletes records)
   PROXY_DNS_TARGET           address for those records (default: first PROXY_BIND)
+  PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
 
 Site files named <service>.<host>.caddy also get one wildcard certificate per host
 (*.<host>.<domain>), so further services on that host need no new certificate.
+
+A `# check: ...` line in a site or tcp file defines its status check, shown as a
+dot on the sites page (green up, yellow checking/unsure, red down, black none):
+  # check: /health [codes]   GET through the proxy (default codes 200-399)
+  # check: https://...       GET an absolute URL
+  # check: tcp [host:port]   TCP connect (default: the file's upstream)
+  # check: run <command>     exit 0 up, 1 down, other unsure; first output line is the note
 
 Commands:
   check    build and validate the configuration without applying it
@@ -31,19 +39,24 @@ Commands:
   sites    list published sites and skipped entries
   status   show whether the proxy is disabled, running or failing
   logs     show recent Caddy log lines (-n N)
+  checks   run the status checks that are due, then list every state
   ca       show where to get the internal CA root certificate
   run      (used by the image's supervisor) build and run Caddy in the foreground
 """
+import fcntl
 import html
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", "/home/paseo"))
@@ -53,12 +66,16 @@ CANDIDATE = STATE / "candidate"
 LOG = STATE / "caddy.log"
 ERROR = STATE / "last-error.txt"
 REPORT = STATE / "report.json"
+STATUS = STATE / "status.json"
+CHECK_LOCK = STATE / "checks.lock"
 CA_ROOT = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "caddy/pki/authorities/local/root.crt"
 TEMPLATE_README = Path("/usr/local/share/workstation-proxy/README.md")
 WORKSPACE = Path(os.environ.get("PROXY_STATIC_ALLOWED", "/workspace"))
 ADMIN = os.environ.get("PROXY_ADMIN", "localhost:2019")  # Caddy admin API (loopback)
 RESERVED = {"paseo", "sites"}
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+CHECK_LINE = re.compile(r"^\s*#\s*check:\s*(.*?)\s*$", re.M)
+CHECK_TIMEOUT = 10  # seconds per check
 DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
 
 
@@ -79,6 +96,7 @@ def settings():
         problems.append("PROXY_DOMAIN is set but no CLOUDFLARE_API_TOKEN(_FILE): public HTTPS disabled")
         public = ""
     paseo_port = env("PASEO_LISTEN", "0.0.0.0:6767").rsplit(":", 1)[-1]
+    interval = env("PROXY_CHECK_INTERVAL", "300")
     return {
         "public": public,
         "lan": lan,
@@ -87,6 +105,7 @@ def settings():
         "https_port": env("PROXY_HTTPS_PORT", "443"),
         "config": Path(env("PROXY_CONFIG_DIR", "/workspace/proxy")),
         "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
+        "check_interval": max(60, int(interval)) if interval.isdigit() else 300,
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
         "dns_target": env("PROXY_DNS_TARGET") or next(
             (a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if re.fullmatch(r"[0-9.]+", a)), ""),
@@ -157,7 +176,7 @@ def collect(cfg):
         if name in RESERVED:
             skipped.append({"name": name, "source": f"sites/{path.name}", "reason": "reserved name"})
         else:
-            sites.append({"name": name, "source": f"sites/{path.name}", "path": str(path)})
+            sites.append({"name": name, "source": f"sites/{path.name}", "path": str(path), "check": check_line(path)})
     taken = {s["name"] for s in sites} | RESERVED
     for entry in sorted(www_dir.iterdir()) if www_dir.is_dir() else []:
         name = entry.name
@@ -171,13 +190,23 @@ def collect(cfg):
         else:
             root, reason = check_static(entry)
             if root:
-                static.append({"name": name, "source": f"www/{name}", "root": str(root)})
+                static.append({"name": name, "source": f"www/{name}", "root": str(root), "check": "static folder"})
             else:
                 skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
     tcp_dir = cfg["config"] / "tcp"
-    tcp = [{"name": path.stem, "source": f"tcp/{path.name}", "path": str(path), "ports": forward_ports(path)}
+    tcp = [{"name": path.stem, "source": f"tcp/{path.name}", "path": str(path), "ports": forward_ports(path),
+            "check": check_line(path)}
            for path in (sorted(tcp_dir.glob("*.caddy")) if tcp_dir.is_dir() else [])]
     return sites, static, skipped, tcp
+
+
+def check_line(path):
+    """The status check defined by a `# check: ...` line ("" when there is none)."""
+    try:
+        found = CHECK_LINE.search(Path(path).read_text())
+    except OSError:
+        return ""
+    return found.group(1) if found else ""
 
 
 def forward_ports(path):
@@ -284,7 +313,8 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
 
     # Reserved sites, the unknown-name page and public HTTP->HTTPS redirects.
     out += ["import site paseo {", f"\treverse_proxy 127.0.0.1:{cfg['paseo_port']}", "}", "",
-            "import site sites {", "\thandle /root.crt {",
+            "import site sites {", "\thandle /status.json {", "\t\theader Cache-Control no-store",
+            f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}", "\thandle /root.crt {",
             f"\t\troot * {quote(CA_ROOT.parent)}", "\t\trewrite * /root.crt", "\t\tfile_server", "\t}",
             "\thandle {", f"\t\troot * {quote(index)}", "\t\tfile_server", "\t}", "}", ""]
     unknown = ["\troot * " + quote(index), "\trewrite * /404.html", "\tfile_server {", "\t\tstatus 404", "\t}"]
@@ -320,29 +350,67 @@ def urls(cfg, name):
     return found
 
 
+# The sites page fills in the dots from /status.json (see `checks`).
+STATUS_SCRIPT = """<script>
+const colors = {up: "#1a7f37", down: "#cf222e", unsure: "#d4a72c", checking: "#d4a72c", none: "#24292f"};
+function ago(s) { return s < 90 ? Math.round(s) + "s ago" : Math.round(s / 60) + " min ago"; }
+async function refresh() {
+  let data = {interval: 300, checks: {}};
+  try { data = await (await fetch("/status.json", {cache: "no-store"})).json(); } catch (e) {}
+  const now = Date.now() / 1000;
+  for (const dot of document.querySelectorAll(".dot")) {
+    const r = data.checks[dot.dataset.key];
+    let state = "none", note = "no status check (add a '# check:' line)";
+    if (dot.dataset.check) {
+      if (!r) { state = "checking"; note = "not checked yet"; }
+      else if (now - r.checked > 3 * data.interval) { state = "checking"; note = "stale: " + r.note; }
+      else { state = r.state; note = r.note; }
+      if (r) note += " (" + ago(now - r.checked) + ")";
+    }
+    dot.style.color = colors[state];
+    dot.title = state;
+    dot.parentElement.parentElement.querySelector(".note").textContent = state + ": " + note;
+  }
+}
+refresh();
+setInterval(refresh, 30000);
+</script>"""
+
+
+def dot(key, check):
+    return (f'<span class=dot data-key="{html.escape(key)}"{" data-check=1" if check else ""}'
+            ' aria-label=status>&#9679;</span>')
+
+
 def pages(cfg, sites, static, skipped, tcp, degraded):
-    def listing(title):
+    def listing(title, live):
         rows = []
         for kind, items in (("site", sites), ("static", static)):
             for item in items:
                 if degraded and kind == "site":
                     continue
                 links = " ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in urls(cfg, item["name"]))
-                rows.append(f"<tr><td>{html.escape(item['name'])}</td><td>{kind}</td><td>{links}</td></tr>")
+                status = f"<td>{dot(kind + ':' + item['name'], item['check'])}</td>" if live else ""
+                note = "<td class=note></td>" if live else ""
+                rows.append(f"<tr>{status}<td>{html.escape(item['name'])}</td><td>{kind}</td><td>{links}</td>{note}</tr>")
         skips = "".join(f"<li>{html.escape(s['source'])}: {html.escape(s['reason'])}</li>" for s in skipped)
         forwards = "" if degraded else "".join(
-            f"<li>{html.escape(t['name'])}: {html.escape(', '.join(t['ports']) or 'custom rule')}</li>" for t in tcp)
+            (f"<tr><td>{dot('tcp:' + t['name'], t['check'])}</td>" if live else "<tr>") +
+            f"<td>{html.escape(t['name'])}</td><td>{html.escape(', '.join(t['ports']) or 'custom rule')}</td>" +
+            ("<td class=note></td>" if live else "") + "</tr>" for t in tcp)
         ca = ('<p>Internal CA root for <code>https://*.' + html.escape(cfg["lan"]) +
               '</code>: <a href="/root.crt">root.crt</a> (install it on a device to trust those names).</p>'
               if cfg["lan"] else "")
         note = "<p><strong>Site files are disabled: the configuration has an error. Run <code>workstation-proxy check</code>.</strong></p>" if degraded else ""
         return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
                 f"<title>{html.escape(title)}</title><style>body{{font:15px system-ui;margin:2em;max-width:60em}}"
-                "td{padding:.2em 1em .2em 0}</style>"
+                "td{padding:.2em 1em .2em 0}.dot{font-size:1.2em;color:#d4a72c}.note{color:#57606a;font-size:.9em}</style>"
                 f"<h1>{html.escape(title)}</h1>{note}<table>{''.join(rows) or '<tr><td>No sites yet.</td></tr>'}</table>"
-                f"{'<h2>TCP forwards</h2><ul>' + forwards + '</ul>' if forwards else ''}"
-                f"{'<h2>Skipped</h2><ul>' + skips + '</ul>' if skips else ''}{ca}")
-    return {"index.html": listing("Sites"), "404.html": listing("Unknown site")}
+                f"{'<h2>TCP forwards</h2><table>' + forwards + '</table>' if forwards else ''}"
+                f"{'<h2>Skipped</h2><ul>' + skips + '</ul>' if skips else ''}{ca}"
+                f"{STATUS_SCRIPT if live else ''}")
+    # Only the index page has live dots: unknown names serve 404.html for every path.
+    return {"index.html": listing("Sites", True), "404.html": listing("Unknown site", False)}
 
 
 def build(target, cfg, include_sites=True):
@@ -428,6 +496,134 @@ def running():
             return True
     except OSError:
         return False
+
+
+# ----- status checks ---------------------------------------------------------
+
+def check_targets(report):
+    """Published entries as (key, item); key is kind:name, as used by the sites page."""
+    found = [("static:" + item["name"], dict(item, kind="static")) for item in report["static"]]
+    if not report["degraded"]:
+        found += [("site:" + item["name"], dict(item, kind="site")) for item in report["sites"]]
+        found += [("tcp:" + item["name"], dict(item, kind="tcp")) for item in report.get("tcp", [])]
+    return found
+
+
+def upstream(path):
+    """host:port of the first `import proxy NAME UPSTREAM` or `import forward PORT UPSTREAM`."""
+    try:
+        found = re.search(r"^\s*import\s+(?:proxy\s+\S+|forward\s+\d+)\s+(\S+)", Path(path).read_text(), re.M)
+    except OSError:
+        return ""
+    return re.sub(r"^\w+://", "", found.group(1)).split("/")[0] if found else ""
+
+
+def codes_match(code, spec):
+    for part in re.split(r"[,\s]+", spec or "200-399"):
+        low, _, high = part.partition("-")
+        if part == code or (re.fullmatch(r"\dxx", part) and part[0] == code[0]) or (
+                high and low.isdigit() and high.isdigit() and int(low) <= int(code) <= int(high)):
+            return True
+    return False
+
+
+def check_http(cfg, item, target, codes):
+    extra = []
+    if target.startswith("/"):
+        if item["kind"] != "site":
+            return "unsure", "a path check needs a site file"
+        # Through the proxy's own address: DNS name, certificate, proxy and app together.
+        scheme, port = ("https", cfg["https_port"]) if cfg["public"] else ("http", cfg["http_port"])
+        host = f"{item['name']}.{cfg['public'] or cfg['lan']}"
+        address = next((a for a in cfg["bind"]), "127.0.0.1")
+        address = f"[{address}]" if ":" in address and not address.startswith("[") else address
+        extra = ["--resolve", f"{host}:{port}:{address}"]
+        target = f"{scheme}://{host}" + ("" if port in ("80", "443") else f":{port}") + target
+    result = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
+                             str(CHECK_TIMEOUT), *extra, target], capture_output=True, text=True)
+    code = result.stdout.strip()
+    if result.returncode or not code.isdigit() or code == "000":
+        message = (result.stderr.strip().splitlines() or ["no answer"])[-1].removeprefix("curl: ")
+        # 35/60: TLS or certificate problems; the site may be fine, the check can't tell.
+        return ("unsure" if result.returncode in (35, 60) else "down"), message[:160]
+    if codes_match(code, codes):
+        return "up", f"HTTP {code}"
+    return ("down" if code.startswith("5") else "unsure"), f"HTTP {code} (expected {codes or '200-399'})"
+
+
+def check_tcp(address):
+    host, _, port = address.rpartition(":")
+    if not host or not port.isdigit():
+        return "unsure", f"no host:port to check ({address or 'none found'})"
+    try:
+        with socket.create_connection((host.strip("[]"), int(port)), timeout=CHECK_TIMEOUT):
+            return "up", f"{address} accepts connections"
+    except OSError as error:
+        return "down", f"{address}: {error.strerror or type(error).__name__}"
+
+
+def check_command(cfg, item, command):
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("CLOUDFLARE_API_TOKEN")}
+    environment.update(CHECK_NAME=item["name"], CHECK_URL=(urls(cfg, item["name"]) or [""])[0])
+    try:
+        result = subprocess.run(["bash", "-c", command], cwd=cfg["config"], env=environment,
+                                capture_output=True, text=True, timeout=CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "down", f"timed out after {CHECK_TIMEOUT}s"
+    note = ((result.stdout.strip() or result.stderr.strip()).splitlines() or [f"exit {result.returncode}"])[0]
+    return {0: "up", 1: "down"}.get(result.returncode, "unsure"), note[:160]
+
+
+def run_check(cfg, item):
+    """Return (state, note); state is up, down or unsure."""
+    spec = item["check"]
+    word, _, rest = spec.partition(" ")
+    try:
+        if item["kind"] == "static":
+            return ("up", "static folder") if Path(item["root"]).is_dir() else ("down", "folder is gone")
+        if word.startswith("/") or re.match(r"https?://", word):
+            return check_http(cfg, item, word, rest.strip())
+        if word == "tcp":
+            return check_tcp(rest.strip() or upstream(item["path"]))
+        if word == "run" and rest.strip():
+            return check_command(cfg, item, rest.strip())
+        return "unsure", f"unknown check: {spec[:80]}"
+    except Exception as error:  # one broken check must not stop the others
+        return "unsure", f"check failed: {type(error).__name__}: {error}"[:160]
+
+
+def load_status():
+    try:
+        return json.loads(STATUS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def run_due_checks(cfg, report):
+    """Check every entry whose result is older than the interval (or whose check changed)."""
+    previous, now = load_status().get("checks", {}), time.time()
+    targets = [(key, item) for key, item in check_targets(report) if item.get("check")]
+    due = [(key, item) for key, item in targets
+           if key not in previous or previous[key].get("check") != item["check"]
+           or now - previous[key].get("checked", 0) >= cfg["check_interval"]]
+    results = {key: previous[key] for key, _ in targets if key in previous}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for (key, item), (state, note) in zip(due, pool.map(lambda pair: run_check(cfg, pair[1]), due)):
+            results[key] = {"state": state, "note": note, "checked": int(time.time()), "check": item["check"]}
+    temporary = STATUS.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"interval": cfg["check_interval"], "updated": int(time.time()),
+                                     "checks": results}, indent=1) + "\n")
+    temporary.replace(STATUS)
+
+
+def check_state(item, record, interval, now):
+    if not item.get("check"):
+        return "none", "no status check"
+    if not record:
+        return "checking", "not checked yet"
+    if now - record["checked"] > 3 * interval:
+        return "checking", "stale: " + record["note"]
+    return record["state"], record["note"]
 
 
 # ----- commands --------------------------------------------------------------
@@ -524,6 +720,13 @@ def cmd_status(_):
               f"{len(report.get('tcp', []))} tcp forwards, {len(report['skipped'])} skipped")
         if report["degraded"]:
             print("DEGRADED: site files and tcp forwards are disabled because the configuration is invalid")
+        status, now, counts = load_status(), time.time(), {}
+        for key, item in check_targets(report):
+            state, _ = check_state(item, status.get("checks", {}).get(key), cfg["check_interval"], now)
+            counts[state] = counts.get(state, 0) + 1
+        if counts:
+            print("checks: " + ", ".join(f"{counts[s]} {s}" for s in ("up", "down", "unsure", "checking", "none")
+                                         if s in counts) + " (details: workstation-proxy checks)")
     if ERROR.exists():
         print("last error:\n" + ERROR.read_text().strip())
     return 0 if running() else 1
@@ -541,6 +744,34 @@ def cmd_logs(args):
             print(f"{entry.get('level', '?'):5} {entry.get('logger', '')}: {entry.get('msg', '')} {json.dumps(extra) if extra else ''}")
         except ValueError:
             print(line)
+    return 0
+
+
+def cmd_checks(args):
+    require_enabled()
+    cfg, report = settings(), load_report()
+    if not report:
+        print("no configuration yet: run workstation-proxy reload")
+        return 1
+    quiet = "--quiet" in args
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(CHECK_LOCK, "w") as lock:
+        try:
+            # One run at a time; a second caller just reads the last results.
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not quiet:
+                print("a check run is already in progress; showing the last results")
+        else:
+            run_due_checks(cfg, report)
+    if quiet:
+        return 0
+    status, now = load_status(), time.time()
+    for key, item in check_targets(report):
+        record = status.get("checks", {}).get(key)
+        state, note = check_state(item, record, cfg["check_interval"], now)
+        age = f" ({int(now - record['checked'])}s ago)" if record and state != "none" else ""
+        print(f"{state:9} {item['kind']:7} {item['name']:22} {note}{age}")
     return 0
 
 
@@ -579,7 +810,7 @@ def cmd_run(_):
 
 
 COMMANDS = {"check": cmd_check, "show": cmd_show, "reload": cmd_reload, "sites": cmd_sites, "status": cmd_status,
-            "logs": cmd_logs, "ca": cmd_ca, "run": cmd_run}
+            "logs": cmd_logs, "ca": cmd_ca, "checks": cmd_checks, "run": cmd_run}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
