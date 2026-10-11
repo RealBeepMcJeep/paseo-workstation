@@ -350,65 +350,164 @@ def urls(cfg, name):
     return found
 
 
+# ----- sites page --------------------------------------------------------------
+
+PAGE_STYLE = """
+:root{--bg:#0a0a0b;--panel:#111113;--hover:#16161a;--border:#222227;--text:#e7e7ea;--muted:#8b8b94;
+--faint:#5c5c66;--link:#4ade80;--up:#22c55e;--down:#ef4444;--warn:#eab308}
+*{box-sizing:border-box}
+html{background:var(--bg);color-scheme:dark}
+body{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--text)}
+main{max-width:1040px;margin:0 auto;padding:40px 24px 64px}
+header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px 24px;margin-bottom:20px}
+h1{font-size:22px;font-weight:600;margin:0;letter-spacing:-.01em}
+h2{font-size:13px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:32px 0 10px}
+.sub{color:var(--muted);margin:2px 0 0}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;align-items:center}
+.chip{font:inherit;font-size:12px;color:var(--muted);background:transparent;border:1px solid var(--border);
+border-radius:999px;padding:3px 10px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.chip:hover{color:var(--text);border-color:#33333a}
+.chip.on{color:var(--text);background:var(--hover);border-color:#3a3a42}
+.chip b{font-weight:600;color:var(--text)}
+input{font:inherit;font-size:13px;color:var(--text);background:var(--panel);border:1px solid var(--border);
+border-radius:8px;padding:5px 10px;width:180px;outline:none}
+input:focus{border-color:#3f3f46}
+.list{border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}
+.row{display:grid;grid-template-columns:18px minmax(160px,1fr) minmax(0,1.2fr);gap:4px 14px;align-items:center;
+padding:11px 16px;border-top:1px solid var(--border)}
+.row:first-child{border-top:0}
+.row:hover{background:var(--hover)}
+.row[hidden]{display:none}
+.name{font-weight:500;color:var(--text);text-decoration:none}
+.kind{font-size:11px;color:var(--faint);margin-left:8px}
+.links{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:2px;font-size:12px}
+.links a{color:var(--muted);text-decoration:none}
+.links a:hover{color:var(--link)}
+.links a.main{color:var(--link)}
+.note{font-size:12px;color:var(--muted);text-align:right;overflow-wrap:anywhere}
+.row[data-state=down] .note{color:#f87171}
+.row[data-state=unsure] .note{color:#facc15}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--warn);justify-self:center}
+.dot.up{background:var(--up);box-shadow:0 0 0 3px rgba(34,197,94,.15)}
+.dot.down{background:var(--down);box-shadow:0 0 0 3px rgba(239,68,68,.18)}
+.dot.unsure{background:var(--warn);box-shadow:0 0 0 3px rgba(234,179,8,.15)}
+.dot.checking{background:var(--warn);animation:pulse 1.4s ease-in-out infinite}
+.dot.none{background:transparent;border:1.5px solid #4a4a52}
+@keyframes pulse{50%{opacity:.35}}
+.plain .row{grid-template-columns:1fr}
+.banner{border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.08);color:#fca5a5;border-radius:10px;padding:10px 14px}
+ul{color:var(--muted);padding-left:20px}
+code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--hover);border:1px solid var(--border);
+border-radius:5px;padding:1px 5px}
+footer{margin-top:28px;color:var(--faint);font-size:12px;display:flex;flex-wrap:wrap;gap:6px 18px}
+footer a{color:var(--muted)}
+@media (max-width:640px){.row{grid-template-columns:18px 1fr}.note{grid-column:2;text-align:left}
+.tools{margin-left:0}input{width:100%}}
+"""
+
 # The sites page fills in the dots from /status.json (see `checks`).
 STATUS_SCRIPT = """<script>
-const colors = {up: "#1a7f37", down: "#cf222e", unsure: "#d4a72c", checking: "#d4a72c", none: "#24292f"};
-function ago(s) { return s < 90 ? Math.round(s) + "s ago" : Math.round(s / 60) + " min ago"; }
+const labels = {up: "Up", down: "Down", unsure: "Unsure", checking: "Checking", none: "No check"};
+let filter = "all";
+function ago(s) { return s < 90 ? Math.round(s) + "s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago"; }
+function apply() {
+  const q = document.getElementById("q").value.trim().toLowerCase();
+  for (const row of document.querySelectorAll(".row[data-key]")) {
+    const state = row.dataset.state === "checking" ? "unsure" : row.dataset.state;
+    row.hidden = (filter !== "all" && state !== filter) || (q && !row.dataset.name.includes(q));
+  }
+  for (const chip of document.querySelectorAll(".chip")) chip.classList.toggle("on", chip.dataset.filter === filter);
+}
 async function refresh() {
   let data = {interval: 300, checks: {}};
   try { data = await (await fetch("/status.json", {cache: "no-store"})).json(); } catch (e) {}
-  const now = Date.now() / 1000;
-  for (const dot of document.querySelectorAll(".dot")) {
-    const r = data.checks[dot.dataset.key];
-    let state = "none", note = "no status check (add a '# check:' line)";
-    if (dot.dataset.check) {
-      if (!r) { state = "checking"; note = "not checked yet"; }
-      else if (now - r.checked > 3 * data.interval) { state = "checking"; note = "stale: " + r.note; }
+  const now = Date.now() / 1000, counts = {all: 0, up: 0, down: 0, unsure: 0, none: 0};
+  for (const row of document.querySelectorAll(".row[data-key]")) {
+    const r = data.checks[row.dataset.key];
+    let state = "none", note = "No check — add a ‘# check:’ line";
+    if (row.dataset.check) {
+      if (!r) { state = "checking"; note = "Not checked yet"; }
+      else if (now - r.checked > 3 * data.interval) { state = "checking"; note = "Stale: " + r.note; }
       else { state = r.state; note = r.note; }
-      if (r) note += " (" + ago(now - r.checked) + ")";
+      if (r) note += " · " + ago(now - r.checked);
     }
-    dot.style.color = colors[state];
-    dot.title = state;
-    dot.parentElement.parentElement.querySelector(".note").textContent = state + ": " + note;
+    row.dataset.state = state;
+    const dot = row.querySelector(".dot");
+    dot.className = "dot " + state;
+    dot.title = labels[state];
+    row.querySelector(".note").textContent = note;
+    counts.all++;
+    counts[state === "checking" ? "unsure" : state]++;
   }
+  for (const chip of document.querySelectorAll(".chip")) chip.querySelector("b").textContent = counts[chip.dataset.filter];
+  if (data.updated) document.getElementById("updated").textContent = "Checked " + ago(now - data.updated);
+  apply();
 }
+for (const chip of document.querySelectorAll(".chip")) chip.onclick = () => { filter = chip.dataset.filter; apply(); };
+document.getElementById("q").oninput = apply;
 refresh();
 setInterval(refresh, 30000);
 </script>"""
 
 
-def dot(key, check):
-    return (f'<span class=dot data-key="{html.escape(key)}"{" data-check=1" if check else ""}'
-            ' aria-label=status>&#9679;</span>')
+def link_label(cfg, url):
+    """Short label for a LAN address, e.g. https · home.lan."""
+    scheme, _, host = url.partition("://")
+    return f"{scheme} \u00b7 {cfg['lan']}" if cfg["lan"] and host.endswith("." + cfg["lan"]) else host
 
 
 def pages(cfg, sites, static, skipped, tcp, degraded):
+    def row(key, name, kind, check, links_html, live):
+        dot = "<span class=dot aria-label=status></span>" if live else ""
+        attrs = f' data-key="{html.escape(key)}" data-name="{html.escape(name)}"{" data-check=1" if check else ""}' if live else ""
+        note = "<div class=note></div>" if live else ""
+        return f"<div class=row{attrs}>{dot}<div><span class=name>{html.escape(name)}</span>" \
+               f"<span class=kind>{kind}</span>{links_html}</div>{note}</div>"
+
+    def site_links(name):
+        found = urls(cfg, name)
+        if not found:
+            return ""
+        main = f'<a class=main href="{html.escape(found[0])}">{html.escape(found[0].split("://", 1)[1])}</a>'
+        rest = "".join(f'<a href="{html.escape(u)}">{html.escape(link_label(cfg, u))}</a>' for u in found[1:])
+        return f"<div class=links>{main}{rest}</div>"
+
     def listing(title, live):
-        rows = []
-        for kind, items in (("site", sites), ("static", static)):
-            for item in items:
-                if degraded and kind == "site":
-                    continue
-                links = " ".join(f'<a href="{html.escape(u)}">{html.escape(u)}</a>' for u in urls(cfg, item["name"]))
-                status = f"<td>{dot(kind + ':' + item['name'], item['check'])}</td>" if live else ""
-                note = "<td class=note></td>" if live else ""
-                rows.append(f"<tr>{status}<td>{html.escape(item['name'])}</td><td>{kind}</td><td>{links}</td>{note}</tr>")
-        skips = "".join(f"<li>{html.escape(s['source'])}: {html.escape(s['reason'])}</li>" for s in skipped)
-        forwards = "" if degraded else "".join(
-            (f"<tr><td>{dot('tcp:' + t['name'], t['check'])}</td>" if live else "<tr>") +
-            f"<td>{html.escape(t['name'])}</td><td>{html.escape(', '.join(t['ports']) or 'custom rule')}</td>" +
-            ("<td class=note></td>" if live else "") + "</tr>" for t in tcp)
-        ca = ('<p>Internal CA root for <code>https://*.' + html.escape(cfg["lan"]) +
-              '</code>: <a href="/root.crt">root.crt</a> (install it on a device to trust those names).</p>'
-              if cfg["lan"] else "")
-        note = "<p><strong>Site files are disabled: the configuration has an error. Run <code>workstation-proxy check</code>.</strong></p>" if degraded else ""
-        return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                f"<title>{html.escape(title)}</title><style>body{{font:15px system-ui;margin:2em;max-width:60em}}"
-                "td{padding:.2em 1em .2em 0}.dot{font-size:1.2em;color:#d4a72c}.note{color:#57606a;font-size:.9em}</style>"
-                f"<h1>{html.escape(title)}</h1>{note}<table>{''.join(rows) or '<tr><td>No sites yet.</td></tr>'}</table>"
-                f"{'<h2>TCP forwards</h2><table>' + forwards + '</table>' if forwards else ''}"
-                f"{'<h2>Skipped</h2><ul>' + skips + '</ul>' if skips else ''}{ca}"
-                f"{STATUS_SCRIPT if live else ''}")
+        rows = [row(f"{kind}:{item['name']}", item["name"], kind, item.get("check"), site_links(item["name"]), live)
+                for kind, items in (("site", sites), ("static", static)) if not (degraded and kind == "site")
+                for item in items]
+        forwards = [] if degraded else [
+            row(f"tcp:{t['name']}", t["name"], "tcp", t.get("check"),
+                f"<div class=links><span>{html.escape(', '.join(t['ports']) or 'custom rule')}</span></div>", live)
+            for t in tcp]
+        count = len(rows) + len(forwards)
+        domain = cfg["public"] or cfg["lan"]
+        sub = (f"{count} published on <code>{html.escape(domain)}</code>" if live else
+               "No site is published at this name. Published sites:")
+        tools = ("<div class=tools>" + "".join(
+            f'<button class=chip data-filter={key}>{label} <b>–</b></button>'
+            for key, label in (("all", "All"), ("up", "Up"), ("down", "Down"), ("unsure", "Unsure"), ("none", "No check")))
+            + "<input id=q type=search placeholder='Filter by name' aria-label='Filter by name'></div>") if live else ""
+        banner = ("<p class=banner>Site files are disabled: the configuration has an error. "
+                  "Run <code>workstation-proxy check</code>.</p>") if degraded else ""
+        plain = "" if live else " plain"
+        body = (f"<div class='list{plain}'>{''.join(rows)}</div>" if rows else "<p class=sub>No sites yet.</p>")
+        if forwards:
+            body += f"<h2>TCP forwards</h2><div class='list{plain}'>{''.join(forwards)}</div>"
+        if skipped:
+            body += "<h2>Skipped</h2><ul>" + "".join(
+                f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
+        footer = []
+        if live:
+            footer.append("<span id=updated>Not checked yet</span>")
+        if cfg["lan"]:
+            footer.append(f"<span>Internal CA for <code>*.{html.escape(cfg['lan'])}</code>: "
+                          "<a href='/root.crt'>root.crt</a> (install it on a device to trust those names)</span>")
+        return ("<!doctype html><html lang=en><meta charset=utf-8>"
+                "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
+                f"<title>{html.escape(title)}</title><style>{PAGE_STYLE}</style><main>"
+                f"<header><div><h1>{html.escape(title)}</h1><p class=sub>{sub}</p></div>{tools}</header>"
+                f"{banner}{body}<footer>{''.join(footer)}</footer></main>{STATUS_SCRIPT if live else ''}")
     # Only the index page has live dots: unknown names serve 404.html for every path.
     return {"index.html": listing("Sites", True), "404.html": listing("Unknown site", False)}
 
