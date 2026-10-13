@@ -128,6 +128,9 @@ and lists every state. Edit a check line, then `reload`, like any other change.
 ## Reserved and automatic
 
 - `paseo` is the Paseo web UI; `sites` is the index page and the CA root download.
+- With a public domain, the index page also lists the zone's DNS records that point to local
+  (private) addresses, such as direct host names. It's refreshed from Cloudflare every
+  `PROXY_CHECK_INTERVAL` seconds.
 - Unknown names show a 404 page listing the published sites.
 - Files here are trusted configuration. Never put secrets in them; tokens come from the
   container environment.
