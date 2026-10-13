@@ -31,6 +31,8 @@ dot on the sites page (green up, yellow checking/unsure, red down, black none):
   # check: https://...       GET an absolute URL
   # check: tcp [host:port]   TCP connect (default: the file's upstream)
   # check: run <command>     exit 0 up, 1 down, other unsure; first output line is the note
+With a public domain, the page also lists the zone's records that point to private
+addresses (refreshed from Cloudflare at the same interval).
 
 Commands:
   check    build and validate the configuration without applying it
@@ -45,6 +47,7 @@ Commands:
 """
 import fcntl
 import html
+import ipaddress
 import json
 import os
 import re
@@ -67,6 +70,7 @@ LOG = STATE / "caddy.log"
 ERROR = STATE / "last-error.txt"
 REPORT = STATE / "report.json"
 STATUS = STATE / "status.json"
+DNS_LIST = STATE / "dns.json"
 CHECK_LOCK = STATE / "checks.lock"
 CA_ROOT = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "caddy/pki/authorities/local/root.crt"
 TEMPLATE_README = Path("/usr/local/share/workstation-proxy/README.md")
@@ -235,19 +239,25 @@ def cloudflare(method, path, data=None):
         return json.load(error)
 
 
+def zone_id(cfg):
+    """Cloudflare zone of PROXY_DOMAIN; the zone may be a parent of it."""
+    labels = cfg["public"].split(".")
+    for i in range(len(labels) - 1):
+        found = cloudflare("GET", "/zones?name=" + ".".join(labels[i:])).get("result") or []
+        if found:
+            return found[0]["id"]
+    return None
+
+
 def ensure_dns(cfg, names):
     """Create missing *.<host>.<domain> A records. Create-only; returns per-host results."""
     if not (cfg["manage_dns"] and cfg["public"] and names):
         return []
     if not cfg["dns_target"]:
         return [{"name": "*", "state": "error: set PROXY_DNS_TARGET (or an IPv4 PROXY_BIND)"}]
-    results, zone, labels = [], None, cfg["public"].split(".")
+    results = []
     try:
-        for i in range(len(labels) - 1):  # the zone may be a parent of PROXY_DOMAIN
-            found = cloudflare("GET", "/zones?name=" + ".".join(labels[i:])).get("result") or []
-            if found:
-                zone = found[0]["id"]
-                break
+        zone = zone_id(cfg)
         if not zone:
             return [{"name": "*", "state": f"error: no Cloudflare zone found for {cfg['public']}"}]
         for host in names:
@@ -314,6 +324,8 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
     # Reserved sites, the unknown-name page and public HTTP->HTTPS redirects.
     out += ["import site paseo {", f"\treverse_proxy 127.0.0.1:{cfg['paseo_port']}", "}", "",
             "import site sites {", "\thandle /status.json {", "\t\theader Cache-Control no-store",
+            f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}",
+            "\thandle /dns.json {", "\t\theader Cache-Control no-store",
             f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}", "\thandle /root.crt {",
             f"\t\troot * {quote(CA_ROOT.parent)}", "\t\trewrite * /root.crt", "\t\tfile_server", "\t}",
             "\thandle {", f"\t\troot * {quote(index)}", "\t\tfile_server", "\t}", "}", ""]
@@ -384,6 +396,8 @@ padding:11px 16px;border-top:1px solid var(--border)}
 .links a{color:var(--muted);text-decoration:none}
 .links a:hover{color:var(--link)}
 .links a.main{color:var(--link)}
+.links span{color:var(--muted)}
+.tag{font-size:11px;color:var(--link);margin-left:8px}
 .note{font-size:12px;color:var(--muted);text-align:right;overflow-wrap:anywhere}
 .row[data-state=down] .note{color:#f87171}
 .row[data-state=unsure] .note{color:#facc15}
@@ -416,7 +430,30 @@ function apply() {
     const state = row.dataset.state === "checking" ? "unsure" : row.dataset.state;
     row.hidden = (filter !== "all" && state !== filter) || (q && !row.dataset.name.includes(q));
   }
+  for (const row of document.querySelectorAll(".dnsrow"))
+    row.hidden = filter !== "all" || (q && !row.dataset.name.includes(q));
   for (const chip of document.querySelectorAll(".chip")) chip.classList.toggle("on", chip.dataset.filter === filter);
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; }
+async function loadDns() {
+  let data;
+  try { data = await (await fetch("/dns.json", {cache: "no-store"})).json(); } catch (e) { return; }
+  const list = document.getElementById("dns-list");
+  list.replaceChildren(...data.records.map((r) => {
+    const row = el("div", "row dnsrow"), main = el("div"), links = el("div", "links");
+    row.dataset.name = r.name.toLowerCase();
+    main.append(el("span", "name", r.name));
+    if (r.address === data.proxy) main.append(el("span", "tag", "\u2192 proxy"));
+    links.append(el("span", "", r.address));
+    if (r.comment) links.append(el("span", "", r.comment));
+    main.append(links); row.append(main);
+    return row;
+  }));
+  document.getElementById("dns-note").textContent = data.records.length + " records point to local addresses" +
+    (data.error ? " \u00b7 last refresh failed: " + data.error : "") + " \u00b7 refreshed " +
+    ago(Date.now() / 1000 - data.updated);
+  document.getElementById("dns").hidden = !data.records.length && !data.error;
+  apply();
 }
 async function refresh() {
   let data = {interval: 300, checks: {}};
@@ -446,7 +483,8 @@ async function refresh() {
 for (const chip of document.querySelectorAll(".chip")) chip.onclick = () => { filter = chip.dataset.filter; apply(); };
 document.getElementById("q").oninput = apply;
 refresh();
-setInterval(refresh, 30000);
+loadDns();
+setInterval(() => { refresh(); loadDns(); }, 30000);
 </script>"""
 
 
@@ -494,6 +532,9 @@ def pages(cfg, sites, static, skipped, tcp, degraded):
         body = (f"<div class='list{plain}'>{''.join(rows)}</div>" if rows else "<p class=sub>No sites yet.</p>")
         if forwards:
             body += f"<h2>TCP forwards</h2><div class='list{plain}'>{''.join(forwards)}</div>"
+        if live:
+            body += ("<section id=dns hidden><h2>DNS records</h2><p class=sub id=dns-note></p>"
+                     "<div class='list plain' id=dns-list></div></section>")
         if skipped:
             body += "<h2>Skipped</h2><ul>" + "".join(
                 f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
@@ -691,11 +732,60 @@ def run_check(cfg, item):
         return "unsure", f"check failed: {type(error).__name__}: {error}"[:160]
 
 
-def load_status():
+def load_json(path):
     try:
-        return json.loads(STATUS.read_text())
+        return json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+
+
+def load_status():
+    return load_json(STATUS)
+
+
+def write_json(path, data):
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, indent=1) + "\n")
+    temporary.replace(path)
+
+
+def private(address):
+    try:
+        return ipaddress.ip_address(address).is_private
+    except ValueError:
+        return False
+
+
+def refresh_dns(cfg):
+    """List the zone's A/AAAA records under PROXY_DOMAIN that point to private addresses,
+    for the sites page. At most once per check interval; one API call per 500 records."""
+    if not (cfg["public"] and token()):
+        DNS_LIST.unlink(missing_ok=True)
+        return
+    previous = load_json(DNS_LIST)
+    if time.time() - previous.get("updated", 0) < cfg["check_interval"]:
+        return
+    data = {"updated": int(time.time()), "proxy": cfg["dns_target"], "records": previous.get("records", [])}
+    try:
+        zone, records, page = zone_id(cfg), [], 1
+        if not zone:
+            raise ValueError(f"no Cloudflare zone found for {cfg['public']}")
+        while True:
+            answer = cloudflare("GET", f"/zones/{zone}/dns_records?per_page=500&page={page}")
+            if not answer.get("success"):
+                raise ValueError("; ".join(e.get("message", "?") for e in answer.get("errors", [])) or "request failed")
+            records += [{"name": r["name"], "address": r["content"], "comment": r.get("comment") or ""}
+                        for r in answer["result"] if r["type"] in ("A", "AAAA") and private(r["content"])
+                        and (r["name"] == cfg["public"] or r["name"].endswith("." + cfg["public"]))]
+            if page >= (answer.get("result_info") or {}).get("total_pages", 1):
+                break
+            page += 1
+        # The domain's wildcard first, then each host followed by its *.<host> wildcard.
+        data["records"] = sorted(records, key=lambda r: (r["name"] != "*." + cfg["public"],
+                                                         r["name"].removeprefix("*."), r["name"].startswith("*.")))
+    except (OSError, ValueError, KeyError) as error:
+        data["error"] = f"{type(error).__name__}: {error}"[:160]  # keep the last good list
+    write_json(DNS_LIST, data)
 
 
 def run_due_checks(cfg, report):
@@ -709,10 +799,7 @@ def run_due_checks(cfg, report):
     with ThreadPoolExecutor(max_workers=8) as pool:
         for (key, item), (state, note) in zip(due, pool.map(lambda pair: run_check(cfg, pair[1]), due)):
             results[key] = {"state": state, "note": note, "checked": int(time.time()), "check": item["check"]}
-    temporary = STATUS.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"interval": cfg["check_interval"], "updated": int(time.time()),
-                                     "checks": results}, indent=1) + "\n")
-    temporary.replace(STATUS)
+    write_json(STATUS, {"interval": cfg["check_interval"], "updated": int(time.time()), "checks": results})
 
 
 def check_state(item, record, interval, now):
@@ -863,6 +950,7 @@ def cmd_checks(args):
                 print("a check run is already in progress; showing the last results")
         else:
             run_due_checks(cfg, report)
+            refresh_dns(cfg)
     if quiet:
         return 0
     status, now = load_status(), time.time()

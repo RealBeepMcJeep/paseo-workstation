@@ -121,7 +121,7 @@ Off unless at least one domain is set in the stack's environment:
 | `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
 | `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
 | `PROXY_MANAGE_DNS=true` | For each `<service>.<host>` site, create the Cloudflare record `*.<host>.example.com` → `PROXY_DNS_TARGET` (default: first `PROXY_BIND`) if it's missing. Create-only: never edits or deletes records |
-| `PROXY_CHECK_INTERVAL=300` | Seconds between status checks of one site (minimum 60). Checks are `# check:` lines in site files; results are dots on the sites page |
+| `PROXY_CHECK_INTERVAL=300` | Seconds between status checks of one site (minimum 60). Checks are `# check:` lines in site files; results are dots on the sites page. The same interval refreshes the page's list of local DNS records |
 
 Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
 drop static files in `www/<name>/`, or forward a raw TCP port with
