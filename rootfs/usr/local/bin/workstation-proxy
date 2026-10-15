@@ -422,6 +422,11 @@ code{font:.75rem ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--ho
 border-radius:5px;padding:1px 5px}
 footer{margin-top:28px;color:var(--faint);font-size:.75rem;display:flex;flex-wrap:wrap;gap:6px 18px}
 footer a{color:var(--muted)}
+.lost{min-height:70vh;display:flex;flex-direction:column;justify-content:center;max-width:36rem;margin:0 auto}
+.lost .code{font:600 .8125rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--faint);letter-spacing:.12em;margin:0 0 6px}
+.lost .host{color:var(--text);font-weight:500;overflow-wrap:anywhere}
+.button{display:inline-block;margin-top:20px;padding:8px 14px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--link);text-decoration:none;font-weight:500}
+.button:hover{border-color:var(--link)}
 @media (max-width:640px){.row{grid-template-columns:18px minmax(0,1fr)}.note{grid-column:2;text-align:left;max-width:none}
 .tools{margin-left:0}input{width:100%}}
 """
@@ -571,6 +576,19 @@ document.getElementById("host").textContent = location.hostname;
 </script>"""
 
 
+def not_found_page(cfg):
+    """The page for names nothing is published at: say so and link to the index."""
+    index = f"https://sites.{cfg['public']}" if cfg["public"] else f"http://sites.{cfg['lan']}"
+    return ("<!doctype html><html lang=en><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
+            f"<title>Unknown site</title><link rel=icon href=\"{FAVICON.replace('{color}', '%2371717a')}\">"
+            f"<style>{PAGE_STYLE}</style><div class=wrap><main class=lost>"
+            "<p class=code>404</p><h1>Unknown site</h1>"
+            "<p class=sub><span class=host id=host>This name</span> isn't published here.</p>"
+            f"<p><a class=button href=\"{html.escape(index)}\">See all sites \u2192</a></p>"
+            f"</main></div>{NOT_FOUND_SCRIPT}")
+
+
 def link_label(cfg, url):
     """Short label for a LAN address, e.g. https · home.lan."""
     scheme, _, host = url.partition("://")
@@ -589,12 +607,10 @@ def pages(cfg, sites, static, skipped, tcp, degraded):
         state, note = check_state(item, status.get("checks", {}).get(key), cfg["check_interval"], now)
         return state, ("" if state == "none" else note)
 
-    def row(index, key, name, kind, check, links_html, href, search, live):
+    def row(index, key, name, kind, check, links_html, href, search):
         title = (f'<a class=name href="{html.escape(href)}">{html.escape(name)}</a>' if href
                  else f"<span class=name>{html.escape(name)}</span>")
         tag = f"<span class=kind>{kind}</span>" if kind != "site" else ""
-        if not live:
-            return f"<li class=row><div>{title}{tag}{links_html}</div></li>"
         state, note = state_of(key, {"check": check})
         label = STATE_LABELS[state]
         shown = (f"<span class=sr>{label}: </span>" if state in ("up", "none") else f"{label} · ") + html.escape(note)
@@ -611,16 +627,16 @@ def pages(cfg, sites, static, skipped, tcp, degraded):
         return (f"<div class=links><span>{html.escape(found[0].split('://', 1)[1])}</span>{rest}</div>",
                 found[0], " ".join(found))
 
-    def listing(title, live):
+    def listing(title):
         entries = sorted([("site", item) for item in ([] if degraded else sites)] + [("static", item) for item in static],
                          key=lambda pair: natural(pair[1]["name"]))
         rows, counts = [], {}
         for index, (kind, item) in enumerate(entries):
             links_html, href, search = site_links(item["name"])
             key = f"{kind}:{item['name']}"
-            state = state_of(key, item)[0] if live else "none"
-            rows.append((STATE_ORDER[state] if live else 0, index, row(index, key, item["name"], kind, item.get("check"),
-                                                                     links_html, href, f"{item['name']} {kind} {search}", live)))
+            state = state_of(key, item)[0]
+            rows.append((STATE_ORDER[state], index, row(index, key, item["name"], kind, item.get("check"),
+                                                        links_html, href, f"{item['name']} {kind} {search}")))
             counts[state] = counts.get(state, 0) + 1
         rows = [html_row for _, _, html_row in sorted(rows)]  # down, then unsure, then the rest
         forwards = []
@@ -628,20 +644,16 @@ def pages(cfg, sites, static, skipped, tcp, degraded):
             ports = ", ".join(t["ports"]) or "custom rule"
             forwards.append(row(index, f"tcp:{t['name']}", t["name"], "tcp", t.get("check"),
                                 f"<div class=links><span>{html.escape(ports)}</span></div>", "",
-                                f"{t['name']} tcp {ports}", live))
-            if live:
-                state = state_of(f"tcp:{t['name']}", t)[0]
-                counts[state] = counts.get(state, 0) + 1
+                                f"{t['name']} tcp {ports}"))
+            state = state_of(f"tcp:{t['name']}", t)[0]
+            counts[state] = counts.get(state, 0) + 1
         domain = cfg["public"] or cfg["lan"]
         down = counts.get("down", 0)
-        if live:
-            parts = f"{len(entries)} site{'s' if len(entries) != 1 else ''} on <code>{html.escape(domain)}</code>"
-            if forwards:
-                parts += f" · {len(forwards)} TCP forward{'s' if len(forwards) != 1 else ''}"
-            sub = (f"{parts}<span id=downs>{' · ' if down else ''}</span>"
-                   f"<b id=downs-n>{f'{down} down' if down else ''}</b>")
-        else:
-            sub = "No site is published at <b id=host>this name</b>. Published sites:"
+        parts = f"{len(entries)} site{'s' if len(entries) != 1 else ''} on <code>{html.escape(domain)}</code>"
+        if forwards:
+            parts += f" · {len(forwards)} TCP forward{'s' if len(forwards) != 1 else ''}"
+        sub = (f"{parts}<span id=downs>{' · ' if down else ''}</span>"
+               f"<b id=downs-n>{f'{down} down' if down else ''}</b>")
         chips = [("all", "All", sum(counts.values())), ("up", "Up", counts.get("up", 0)),
                  ("down", "Down", down), ("unsure", "Unsure", counts.get("unsure", 0) + counts.get("checking", 0)),
                  ("none", "No check", counts.get("none", 0))]
@@ -649,38 +661,35 @@ def pages(cfg, sites, static, skipped, tcp, degraded):
             f'<button type=button class=chip data-filter={key} aria-pressed={"true" if key == "all" else "false"}>'
             f"{label} <b>{count}</b></button>" for key, label, count in chips)
             + "<input id=q type=search placeholder='Filter (press /)' aria-label='Filter by name or address'>"
-            "<span id=shown aria-live=polite></span></div>") if live else ""
+            "<span id=shown aria-live=polite></span></div>")
         banner = ("<p class=banner>Site files are disabled: the configuration has an error. "
                   "Run <code>workstation-proxy check</code>.</p>") if degraded else ""
-        plain = "" if live else " plain"
-        sorted_attr = " data-sorted" if live else ""
-        body = ("<p id=status-error class=banner role=status hidden></p>" if live else "") + banner
-        body += (f"<section data-group><h2 class=sr>Sites</h2><ul class='list{plain}'{sorted_attr}>{''.join(rows)}</ul></section>"
+        body = "<p id=status-error class=banner role=status hidden></p>" + banner
+        body += (f"<section data-group><h2 class=sr>Sites</h2><ul class=list data-sorted>{''.join(rows)}</ul></section>"
                  if rows else "<p class=sub>No sites yet.</p>")
         if forwards:
-            body += f"<section data-group><h2>TCP forwards</h2><ul class='list{plain}'{sorted_attr}>{''.join(forwards)}</ul></section>"
-        if live:
-            body += ("<section data-group hidden><h2>DNS records</h2><p class=sub id=dns-note></p>"
-                     "<ul class='list plain' id=dns-list></ul></section>"
-                     "<p id=empty class=empty hidden>No matches. <button type=button class=chip id=clear>Clear filters</button></p>")
-            if skipped:
-                body += "<h2>Skipped</h2><ul class=skipped>" + "".join(
-                    f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
-        footer = ["<span id=updated>Not checked yet</span>"] if live else []
+            body += f"<section data-group><h2>TCP forwards</h2><ul class=list data-sorted>{''.join(forwards)}</ul></section>"
+        body += ("<section data-group hidden><h2>DNS records</h2><p class=sub id=dns-note></p>"
+                 "<ul class='list plain' id=dns-list></ul></section>"
+                 "<p id=empty class=empty hidden>No matches. <button type=button class=chip id=clear>Clear filters</button></p>")
+        if skipped:
+            body += "<h2>Skipped</h2><ul class=skipped>" + "".join(
+                f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
+        footer = ["<span id=updated>Not checked yet</span>"]
         if cfg["lan"]:
             footer.append(f"<span>Internal CA for <code>*.{html.escape(cfg['lan'])}</code>: "
                           "<a href='/root.crt'>root.crt</a> (install it on a device to trust those names)</span>")
         color = "%23ef4444" if down else "%2322c55e"
         return ("<!doctype html><html lang=en class=nojs><meta charset=utf-8>"
                 "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
-                f"<title>{html.escape(title)}{f' ({down} down)' if live and down else ''}</title>"
+                f"<title>{html.escape(title)}{f' ({down} down)' if down else ''}</title>"
                 f"<link id=favicon rel=icon href=\"{FAVICON.replace('{color}', color)}\">"
                 f"<style>{PAGE_STYLE}</style><div class=wrap>"
                 f"<header><div><h1>{html.escape(title)}</h1><p class=sub id=summary>{sub}</p></div>{tools}</header>"
                 f"<main>{body}</main><footer>{''.join(footer)}</footer></div>"
-                f"{STATUS_SCRIPT.replace('__FAVICON__', FAVICON) if live else NOT_FOUND_SCRIPT}")
-    # Only the index page has live dots: unknown names serve 404.html for every path.
-    return {"index.html": listing("Sites", True), "404.html": listing("Unknown site", False)}
+                f"{STATUS_SCRIPT.replace('__FAVICON__', FAVICON)}")
+    # Unknown names serve 404.html for every path.
+    return {"index.html": listing("Sites"), "404.html": not_found_page(cfg)}
 
 
 def build(target, cfg, include_sites=True):
