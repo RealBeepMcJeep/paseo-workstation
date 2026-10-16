@@ -52,7 +52,8 @@ if [ -n "${GITEA_URL:-}" ]; then
       # in the background for about 10 minutes instead of holding up startup.
       printf 'workstation-start: tea: Gitea not reachable yet; retrying in the background\n' | tee -a "$warnings" >&2
       (
-        for delay in 2 3 5 10 20 30 30 60 60 60 60 60 60 60 60; do
+        # Back off to every 30 s, for about 10 minutes in total.
+        for delay in 2 3 5 10 15 $(printf '30 %.0s' $(seq 19)); do
           sleep "$delay"
           if tea_login; then
             printf 'workstation-start: tea: login added on retry\n' >> "$warnings"
