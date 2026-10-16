@@ -263,7 +263,15 @@ jobs:
           docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
           # tea: the first login attempt fails (fake Gitea not up yet); the background retry adds it.
           for _ in $(seq 1 30); do docker exec smoke tea logins list 2> /dev/null | grep -q '127.0.0.1:18998' && break; sleep 2; done
-          docker exec smoke tea logins list | grep -q '127.0.0.1:18998' || { echo "::error::tea login was not added on retry"; exit 1; }
+          if ! docker exec smoke tea logins list | grep -q '127.0.0.1:18998'; then
+            {
+              echo "== warnings"; docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
+              echo "== tea logins"; docker exec smoke tea logins list
+              echo "== fake Gitea"; docker exec smoke curl -s -m 3 http://127.0.0.1:18998/api/v1/user; echo
+              echo "== processes"; docker exec smoke ps -eo pid,ppid,etimes,args | grep -E 'fake|sleep|workstation|tea' | grep -v grep
+            } 2>&1 | { text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=tea login was not added on retry::${text//$'\n'/'%0A'}"; }
+            exit 1
+          fi
           docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
           docker exec smoke grep -q 'retrying in the background' /home/paseo/.paseo/workstation-startup-warnings.txt \
             || { echo "::error::the first tea login attempt did not hit the race (test fixture problem)"; exit 1; }
