@@ -1,25 +1,25 @@
-# Paseo workstation (Dockge stack "paseo").
+# Paseo workstation (Komodo stack "paseo" on ms-s1; the deployed copy is tracked in
+# the ms-s1 repo as stacks/paseo/compose.yaml, with variable names in env.example).
 # Image: https://github.com/RealBeepMcJeep/paseo-workstation, rebuilt and
 # self-tested by GitHub Actions whenever an upstream version changes.
 #
-# Update:   Dockge "Update" (pull + recreate). Recreating ends running agent
+# Update:   Komodo "Deploy" (pull + recreate). Recreating ends running agent
 #           sessions; their history is kept in the home dataset.
-# Rollback: set PASEO_IMAGE_TAG in the stack .env to an older dated tag
-#           (YYYYMMDD-HHMMSS), then Update. sha-<commit> tags only name the
-#           source commit and are reused by scheduled rebuilds. Restore the home
-#           dataset from a TrueNAS snapshot if a newer agent migrated its data.
+# Rollback: set PASEO_IMAGE_TAG in .env to an older dated tag (YYYYMMDD-HHMMSS),
+#           then Deploy. sha-<commit> tags only name the source commit and are
+#           reused by scheduled rebuilds. Restore home/workspace from a snapshot
+#           if a newer agent migrated its data.
 #
-# Dockge .env: PASEO_PASSWORD (required); GITEA_URL (http://host.docker.internal:3000),
-# GITEA_USER, GITEA_TOKEN;
-# optional MCPHUB_KEY (MCPHub "paseo" group), GH_TOKEN, GIT_USER_NAME,
-# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG, and for the proxy
-# PROXY_DOMAIN, PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN, PROXY_MANAGE_DNS.
+# .env: PASEO_PASSWORD (required); GITEA_URL, GITEA_USER, GITEA_TOKEN;
+# MCPHUB_KEY, MCP_HOMELAB_URL (MCPHub); GH_TOKEN, GIT_USER_NAME,
+# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG; proxy: PROXY_DOMAIN,
+# PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN, PROXY_MANAGE_DNS.
 services:
   paseo:
     image: ghcr.io/realbeepmcjeep/paseo-workstation:${PASEO_IMAGE_TAG:-latest}
     container_name: paseo
     hostname: paseo
-    user: "568:568"
+    user: 568:568
     restart: unless-stopped
     # Room for the optional shutdown hook (75s) plus proxy and Paseo shutdown.
     stop_grace_period: 120s
@@ -27,7 +27,7 @@ services:
     shm_size: 1gb
     environment:
       TZ: America/Phoenix
-      PASEO_PASSWORD: ${PASEO_PASSWORD:?Set PASEO_PASSWORD in the Dockge environment editor}
+      PASEO_PASSWORD: ${PASEO_PASSWORD:?Set PASEO_PASSWORD in .env}
       # app.paseo.sh and Android connect through the outbound relay; no ports.
       PASEO_RELAY_ENABLED: "true"
       GIT_USER_NAME: ${GIT_USER_NAME:-paseo}
@@ -37,7 +37,7 @@ services:
       GITEA_USER: ${GITEA_USER:-paseo}
       GITEA_TOKEN: ${GITEA_TOKEN:-}
       # Agents get an mcphub entry only when MCPHUB_KEY is set.
-      MCP_HOMELAB_URL: ${MCP_HOMELAB_URL:-http://mcphub:3000/mcp/paseo}
+      MCP_HOMELAB_URL: ${MCP_HOMELAB_URL:-}
       MCPHUB_TOKEN: ${MCPHUB_KEY:-}
       # Optional subdomain proxy (see README): off unless a domain is set.
       PROXY_DOMAIN: ${PROXY_DOMAIN:-}
@@ -47,26 +47,56 @@ services:
       # true: create missing *.<host> DNS records for <service>.<host> sites.
       PROXY_MANAGE_DNS: ${PROXY_MANAGE_DNS:-}
     volumes:
+      # rslave: new ZFS snapshots appear under .zfs/snapshot without a restart.
       - type: bind
-        source: /mnt/tank3/apps/paseo/home
+        source: /srv/paseo/home
         target: /home/paseo
         bind:
           create_host_path: false
+          propagation: rslave
       - type: bind
-        source: /mnt/tank3/apps/paseo/workspace
+        source: /srv/paseo/workspace
         target: /workspace
         bind:
           create_host_path: false
-    # macvlan gives Paseo its own LAN IP, so agents can serve ad-hoc ports to the
-    # LAN (bind 0.0.0.0; any port), or publish through the proxy instead. macvlan
-    # cannot reach its own host: address host services as host.docker.internal
-    # (GITEA_URL in .env too).
+          propagation: rslave
+      # Tiers without snapshots: /scratch may be wiped any time; /bulk holds large files.
+      - type: bind
+        source: /srv/scratch/paseo
+        target: /scratch
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/bulk/paseo
+        target: /bulk
+        bind:
+          create_host_path: false
+      # TEMPORARY bind mounts: old paths keep working until rec and modhub switch to
+      # /scratch/rec/builds and /bulk/modhub/recordings (see the handoffs), then delete.
+      - type: bind
+        source: /srv/scratch/paseo/rec/builds
+        target: /workspace/rec/artifacts/builds
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/bulk/paseo/modhub/recordings
+        target: /workspace/modhub/moderation-hub/data/recordings/media
+        bind:
+          create_host_path: false
+      # modhub's capture spool (hard-coded .runtime/media) also lives on /bulk, so capture
+      # churn stays out of snapshots. Until modhub makes both paths configurable, the
+      # spool-to-media hard link is a copy (separate mounts); see the modhub handoff.
+      - type: bind
+        source: /srv/bulk/paseo/modhub/spool
+        target: /workspace/modhub/moderation-hub/.runtime/media
+        bind:
+          create_host_path: false
+    # macvlan gives Paseo its own LAN IP (agents can serve ad-hoc ports to the
+    # LAN, and the proxy's wildcard DNS points here). Other hosts' services are
+    # reached by their DNS names.
     networks:
-      adguard-home_macvlan:
+      lan_macvlan:
         ipv4_address: 192.168.87.49
-      hermes_internal: null
-    extra_hosts:
-      - host.docker.internal:172.28.10.1
     dns:
       - 192.168.86.11
       - 192.168.86.12
@@ -76,9 +106,9 @@ services:
       resources:
         limits:
           # A cap, not a reservation. 12g saw OOM kills with several agents,
-          # language servers, Chromium and project services; raise further only
-          # if memory.events shows new pressure.
-          memory: ${PASEO_MEM_LIMIT:-16g}
+          # language servers, Chromium and project services. The agents
+          # container itself is capped at 64 GiB.
+          memory: ${PASEO_MEM_LIMIT:-48g}
           # The agents share one cgroup: bound runaway process trees. (Must
           # live here: Compose rejects pids_limit next to deploy limits.)
           pids: 4096
@@ -89,8 +119,5 @@ services:
         max-file: "5"
 
 networks:
-  hermes_internal:
-    external: true
-    name: hermes_internal
-  adguard-home_macvlan:
+  lan_macvlan:
     external: true

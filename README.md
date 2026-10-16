@@ -6,7 +6,7 @@ against shared projects. It also bundles **bladebro**, headless **Chromium**,
 dev toolchains and language servers.
 
 The image is published to `ghcr.io/realbeepmcjeep/paseo-workstation`.
-Updating is meant to be just **Update** in Dockge.
+Updating is meant to be just a redeploy (Komodo **Deploy**, or Dockge **Update**).
 
 ## What's inside
 
@@ -60,20 +60,21 @@ schedule alive through the API.
    `https://github.com/RealBeepMcJeep/paseo-workstation.git` with "sync when
    commits are pushed" enabled. The GitHub repository must exist first.
 2. After the first successful run: GitHub → Packages → `paseo-workstation` →
-   Package settings → change visibility to **Public** so Dockge can pull
+   Package settings → change visibility to **Public** so the host can pull
    without credentials.
-3. Optional: in MCPHub create a `paseo` group and key, and add it to Dockge
-   as `MCPHUB_KEY`.
+3. Optional: in MCPHub create a `paseo` group and key, and add it to the
+   stack's `.env` as `MCPHUB_KEY`.
 
-## Deploying in Dockge
+## Deploying
 
-Use [`compose.yaml`](compose.yaml) as the stack file. It is a drop-in for the
-earlier locally built `paseo` stack: same container name, network, datasets
-and UID. Paseo's identity, relay pairing, agent logins and history live in
-the home dataset and carry over.
+Use [`compose.yaml`](compose.yaml) as the stack file (it is the deployed Komodo
+stack; any Compose manager works). It bind-mounts the home and workspace
+datasets, plus `/scratch` (disposable) and `/bulk` (large files), and gives the
+container its own LAN IP on a macvlan network. Paseo's identity, relay pairing,
+agent logins and history live in the home dataset.
 
-Before the first switch, take a TrueNAS snapshot of the `paseo/home` dataset.
-Recreating the container ends running agent sessions; their history is kept.
+Before moving or switching the stack, snapshot the home dataset. Recreating the
+container ends running agent sessions; their history is kept.
 
 What startup manages (in `rootfs/usr/local/bin/workstation-start` and
 `workstation-config`). Everything else in the home is left alone:
@@ -81,7 +82,10 @@ What startup manages (in `rootfs/usr/local/bin/workstation-start` and
 - Git identity, plus a Gitea credential helper that reads `GITEA_TOKEN` from
   the environment and stores nothing.
 - A `tea` login refreshed from `GITEA_TOKEN` on each start. It is stored in a
-  0600 file, because tea cannot log in from the environment.
+  0600 file, because tea cannot log in from the environment. tea checks the
+  token against Gitea, so if Gitea isn't reachable yet (for example when
+  `GITEA_URL` is served by this container's own proxy), the login is retried in
+  the background for about 10 minutes.
 - MCP entries `mcphub` (Claude, Codex, Pi; only when `MCPHUB_KEY` is set) and
   `bladebro` (Claude, Codex). Configs reference `${MCPHUB_TOKEN}`, never the
   key. Pi keeps its own bladebro extension.
@@ -160,7 +164,7 @@ restore the home dataset snapshot while the stack is stopped.
 ## Secrets
 
 The repository and image are public and contain no credentials. Tokens come
-only from the Dockge environment at runtime: `PASEO_PASSWORD`, `GITEA_TOKEN`,
+only from the stack's environment (`.env`) at runtime: `PASEO_PASSWORD`, `GITEA_TOKEN`,
 `GH_TOKEN`, `MCPHUB_KEY` and `CLOUDFLARE_API_TOKEN`. Agent logins and proxy
 certificates live in the home dataset.
 
