@@ -181,7 +181,23 @@ jobs:
           #!/bin/sh
           echo upstream-ok > /workspace/upstream/marker.txt
           cd /workspace/upstream && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &
+          # A fake Gitea that only comes up now, after workstation-start's first tea
+          # login attempt: the same race as GITEA_URL served by the container's own proxy.
+          nohup python3 /workspace/upstream/fake_gitea.py > /dev/null 2>&1 &
           touch "$HOME/autostart-ran"
+          EOF
+          cat > /tmp/smoke/workspace/upstream/fake_gitea.py <<'EOF'
+          import http.server, json
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = {"/api/v1/version": {"version": "1.24.0"}, "/api/v1/user": {"id": 1, "login": "ci"}}.get(self.path.split("?")[0])
+                  self.send_response(200 if body else 404)
+                  self.send_header("Content-Type", "application/json")
+                  self.end_headers()
+                  self.wfile.write(json.dumps(body or {"message": "not found"}).encode())
+              def log_message(self, *args):
+                  pass
+          http.server.HTTPServer(("127.0.0.1", 18998), Handler).serve_forever()
           EOF
           cat > /tmp/smoke/home/.config/workstation/shutdown <<'EOF'
           #!/bin/sh
@@ -199,6 +215,7 @@ jobs:
           sudo chown -R 568:568 /tmp/smoke
           docker run -d --name smoke --user 568:568 --shm-size 1g --security-opt no-new-privileges:true \
             -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_LAN_DOMAIN=selftest.lan -e PROXY_CHECK_INTERVAL=60 \
+            -e GITEA_URL=http://127.0.0.1:18998 -e GITEA_TOKEN=ci-dummy \
             -v /tmp/smoke/home:/home/paseo -v /tmp/smoke/workspace:/workspace \
             "$IMAGE:latest"
           for _ in $(seq 1 60); do
@@ -244,6 +261,14 @@ jobs:
           [ "$(get hello /.env)" = 404 ] || { echo "::error::dotfile was served"; exit 1; }
           [ "$(get escape /passwd)" = 404 ] || { echo "::error::rejected symlink was served"; exit 1; }
           docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
+          # tea: the first login attempt fails (fake Gitea not up yet); the background retry adds it.
+          for _ in $(seq 1 30); do docker exec smoke tea logins list 2> /dev/null | grep -q '127.0.0.1:18998' && break; sleep 2; done
+          docker exec smoke tea logins list | grep -q '127.0.0.1:18998' || { echo "::error::tea login was not added on retry"; exit 1; }
+          docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
+          docker exec smoke grep -q 'retrying in the background' /home/paseo/.paseo/workstation-startup-warnings.txt \
+            || { echo "::error::the first tea login attempt did not hit the race (test fixture problem)"; exit 1; }
+          docker exec smoke grep -q 'login added on retry' /home/paseo/.paseo/workstation-startup-warnings.txt \
+            || { echo "::error::tea retry did not record success"; exit 1; }
           # Status checks: up, down, none (no check line) and the implicit static check.
           # (Interval 60s: a result from before the upstream started is retried within it.)
           for _ in $(seq 1 45); do
