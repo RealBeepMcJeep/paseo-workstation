@@ -81,7 +81,7 @@ fi
 node "$(cat /etc/paseo-server-entry)" "$@" &
 paseo_pid=$!
 
-if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}${PROXY_WWW_PORT:-}" ]; then
+if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}${PROXY_RELAY_PORT:-}" ]; then
   proxy_loop &
   proxy_pid=$!
   checks_loop &

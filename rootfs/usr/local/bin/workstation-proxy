@@ -21,10 +21,15 @@ Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
                              exists (create-only; never edits or deletes records)
   PROXY_DNS_TARGET           address for those records (default: first PROXY_BIND)
   PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
-  PROXY_WWW_PORT             serve the www/ folders over plain HTTP on this port, picked
-                             by the first label of the Host header (<name>.<anything>),
-                             for a proxy running elsewhere. Works with or without the
-                             domains above; without them, only this server runs.
+  PROXY_RELAY_PORT           a relay for a proxy running elsewhere (hq-caddy `relay`):
+                             plain HTTP on this port, answering only PROXY_RELAY_TRUST.
+                             With a numeric X-Hq-Relay-Port header it forwards to
+                             127.0.0.1:<port>; without one it serves www/<name>/ by the
+                             first label of the Host header. Works with or without the
+                             domains above; without them, only the relay runs.
+  PROXY_RELAY_TRUST          the proxy's address(es), comma/space separated; everyone
+                             else gets 403 (all of them while this is unset). Their
+                             X-Forwarded-* headers are kept, so apps still see https.
 
 Site files named <service>.<host>.caddy also get one wildcard certificate per host
 (*.<host>.<domain>), so further services on that host need no new certificate.
@@ -114,7 +119,8 @@ def settings():
         "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
         "check_interval": max(60, int(interval)) if interval.isdigit() else 300,
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
-        "www_port": env("PROXY_WWW_PORT") if env("PROXY_WWW_PORT").isdigit() else "",
+        "relay_port": env("PROXY_RELAY_PORT") if env("PROXY_RELAY_PORT").isdigit() else "",
+        "relay_trust": [a for a in re.split(r"[,\s]+", env("PROXY_RELAY_TRUST")) if a],
         "dns_target": env("PROXY_DNS_TARGET") or next(
             (a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if re.fullmatch(r"[0-9.]+", a)), ""),
         "problems": problems,
@@ -122,7 +128,7 @@ def settings():
 
 
 def enabled():
-    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN") or env("PROXY_WWW_PORT"))
+    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN") or env("PROXY_RELAY_PORT"))
 
 
 def token():
@@ -302,6 +308,9 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
         out.append("\tdefault_bind " + " ".join(cfg["bind"]))
     if public:
         out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
+    if cfg["relay_port"] and cfg["relay_trust"]:
+        # Keep the relay's proxy's X-Forwarded-* (its https) instead of replacing them.
+        out += ["\tservers {", "\t\ttrusted_proxies static " + " ".join(cfg["relay_trust"]), "\t}"]
     serving = bool(public or lan)  # without a domain, only the www/ server runs
     if include_sites and tcp and serving:
         out.append("\tlayer4 {")
@@ -357,13 +366,21 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
     if include_sites and serving:
         for item in sites:
             out += [f"# {item['source']}", f"import {quote(item['path'])}", ""]
-    if cfg["www_port"]:
-        # www/ folders for a proxy elsewhere: <name>.<anything> -> www/<name>/.
-        out += ["# www/ folders for a proxy running elsewhere", f"http://:{cfg['www_port']} {{"]
+    if cfg["relay_port"]:
+        # The relay for a proxy elsewhere: only PROXY_RELAY_TRUST may use it. A numeric
+        # X-Hq-Relay-Port picks a loopback port; otherwise www/<name>/ by the Host's first label.
+        out += ["# Relay for a proxy running elsewhere (hq-caddy `import relay`)",
+                f"http://:{cfg['relay_port']} {{", "\troute {"]
+        if cfg["relay_trust"]:
+            out += ["\t\t@outsider not remote_ip " + " ".join(cfg["relay_trust"]), '\t\trespond @outsider "Forbidden" 403']
+        else:
+            out += ['\t\trespond "Forbidden: PROXY_RELAY_TRUST is not set" 403']
+        out += ["\t\t@port header_regexp X-Hq-Relay-Port ^[0-9]{1,5}$",
+                "\t\treverse_proxy @port 127.0.0.1:{header.X-Hq-Relay-Port} {", "\t\t\theader_up -X-Hq-Relay-Port", "\t\t}"]
         for index, item in enumerate(static):
-            out += [f"\t@www{index} expression {{host}}.startsWith({quote(item['name'] + '.')})",
-                    f"\thandle @www{index} {{", f"\t\timport static_files {quote(item['root'])}", "\t}"]
-        out += ["\thandle {", '\t\trespond "Unknown static site" 404', "\t}", "}", ""]
+            out += [f"\t\t@www{index} expression {{host}}.startsWith({quote(item['name'] + '.')})",
+                    f"\t\thandle @www{index} {{", f"\t\t\timport static_files {quote(item['root'])}", "\t\t}"]
+        out += ['\t\trespond "Unknown static site" 404', "\t}", "}", ""]
     return "\n".join(out) + "\n"
 
 
