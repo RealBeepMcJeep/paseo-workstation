@@ -270,8 +270,10 @@ jobs:
           docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
           # tea: the first login attempt fails (fake Gitea not up yet); the background retry adds it.
           # The retry runs at most 30 s apart; allow three of those.
-          for _ in $(seq 1 45); do docker exec smoke tea logins list 2> /dev/null | grep -q '127.0.0.1:18998' && break; sleep 2; done
-          if ! docker exec smoke tea logins list | grep -q '127.0.0.1:18998'; then
+          # Capture first: `cmd | grep -q` fails under pipefail when grep exits early (SIGPIPE).
+          tea_has_login() { local logins; logins="$(docker exec smoke tea logins list 2> /dev/null || true)"; grep -q '127.0.0.1:18998' <<< "$logins"; }
+          for _ in $(seq 1 45); do tea_has_login && break; sleep 2; done
+          if ! tea_has_login; then
             {
               echo "== warnings"; docker exec smoke cat /home/paseo/.paseo/workstation-startup-warnings.txt
               echo "== tea logins"; docker exec smoke tea logins list
