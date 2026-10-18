@@ -21,6 +21,10 @@ Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
                              exists (create-only; never edits or deletes records)
   PROXY_DNS_TARGET           address for those records (default: first PROXY_BIND)
   PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
+  PROXY_WWW_PORT             serve the www/ folders over plain HTTP on this port, picked
+                             by the first label of the Host header (<name>.<anything>),
+                             for a proxy running elsewhere. Works with or without the
+                             domains above; without them, only this server runs.
 
 Site files named <service>.<host>.caddy also get one wildcard certificate per host
 (*.<host>.<domain>), so further services on that host need no new certificate.
@@ -55,7 +59,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -111,6 +114,7 @@ def settings():
         "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
         "check_interval": max(60, int(interval)) if interval.isdigit() else 300,
         "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
+        "www_port": env("PROXY_WWW_PORT") if env("PROXY_WWW_PORT").isdigit() else "",
         "dns_target": env("PROXY_DNS_TARGET") or next(
             (a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if re.fullmatch(r"[0-9.]+", a)), ""),
         "problems": problems,
@@ -118,7 +122,7 @@ def settings():
 
 
 def enabled():
-    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN"))
+    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN") or env("PROXY_WWW_PORT"))
 
 
 def token():
@@ -298,7 +302,8 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
         out.append("\tdefault_bind " + " ".join(cfg["bind"]))
     if public:
         out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
-    if include_sites and tcp:
+    serving = bool(public or lan)  # without a domain, only the www/ server runs
+    if include_sites and tcp and serving:
         out.append("\tlayer4 {")
         out += [f"\t\timport {quote(item['path'])}" for item in tcp]
         out.append("\t}")
@@ -349,9 +354,16 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
     for item in static:
         out += [f"# {item['source']}", f"import site {item['name']} {{",
                 f"\timport static_files {quote(item['root'])}", "}", ""]
-    if include_sites:
+    if include_sites and serving:
         for item in sites:
             out += [f"# {item['source']}", f"import {quote(item['path'])}", ""]
+    if cfg["www_port"]:
+        # www/ folders for a proxy elsewhere: <name>.<anything> -> www/<name>/.
+        out += ["# www/ folders for a proxy running elsewhere", f"http://:{cfg['www_port']} {{"]
+        for index, item in enumerate(static):
+            out += [f"\t@www{index} expression {{host}}.startsWith({quote(item['name'] + '.')})",
+                    f"\thandle @www{index} {{", f"\t\timport static_files {quote(item['root'])}", "\t}"]
+        out += ["\thandle {", '\t\trespond "Unknown static site" 404', "\t}", "}", ""]
     return "\n".join(out) + "\n"
 
 
@@ -965,9 +977,11 @@ def report_problems(cfg):
 
 
 def cmd_check(_):
-    require_enabled()
     cfg = settings()
     report_problems(cfg)
+    if not (cfg["public"] or cfg["lan"]):
+        # The proxy runs elsewhere: still validate site files, against a placeholder domain.
+        cfg["lan"] = "example.lan"
     STATE.mkdir(parents=True, exist_ok=True)
     report = build(CANDIDATE, cfg)
     ok, message = validate(CANDIDATE)
