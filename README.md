@@ -126,7 +126,8 @@ Off unless at least one domain is set in the stack's environment:
 | `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
 | `PROXY_MANAGE_DNS=true` | For each `<service>.<host>` site, create the Cloudflare record `*.<host>.example.com` → `PROXY_DNS_TARGET` (default: first `PROXY_BIND`) if it's missing. Create-only: never edits or deletes records |
 | `PROXY_CHECK_INTERVAL=300` | Seconds between status checks of one site (minimum 60). Checks are `# check:` lines in site files; results are dots on the sites page. The same interval refreshes the page's list of local DNS records |
-| `PROXY_WWW_PORT=8800` | Serve the `www/` folders over plain HTTP on this port for a proxy running elsewhere (e.g. hq-caddy), picked by the first label of the requested name: `<name>.<anything>` → `www/<name>/`. Same safety rules as the built-in proxy. Without `PROXY_DOMAIN`/`PROXY_LAN_DOMAIN`, only this server runs (no sites, no TCP forwards); `workstation-proxy check` still validates site files |
+| `PROXY_RELAY_PORT=8800` | A relay for a proxy running elsewhere (hq-caddy's `import relay`): plain HTTP on this port, answering only `PROXY_RELAY_TRUST`. With a numeric `X-Hq-Relay-Port` header it forwards to `127.0.0.1:<port>`, so services can stay loopback-only; without one it serves `www/<name>/` by the first label of the requested name. Without `PROXY_DOMAIN`/`PROXY_LAN_DOMAIN`, only the relay runs (no sites, no TCP forwards); `workstation-proxy check` still validates site files |
+| `PROXY_RELAY_TRUST=192.0.2.10` | The proxy's address(es), comma- or space-separated. Everyone else gets 403 (everyone, while unset). Their `X-Forwarded-*` headers are kept, so apps that trust loopback still see `https` |
 
 Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
 drop static files in `www/<name>/`, or forward a raw TCP port with
