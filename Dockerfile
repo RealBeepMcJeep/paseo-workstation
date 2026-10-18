@@ -9,8 +9,8 @@
 # Layers run from slowest- to fastest-changing, so a new agent CLI release
 # rebuilds only the last layers.
 
-ARG NODE_IMAGE=public.ecr.aws/docker/library/node:22-trixie-slim
-ARG GOLANG_IMAGE=public.ecr.aws/docker/library/golang:1-trixie
+ARG NODE_IMAGE=mirror.gcr.io/library/node:22-trixie-slim
+ARG GOLANG_IMAGE=mirror.gcr.io/library/golang:1-trixie
 
 # Caddy for the optional subdomain proxy (workstation-proxy), built with the
 # Cloudflare DNS module and caddy-l4 (TCP forwarding) at exact versions. Go verifies every module download
