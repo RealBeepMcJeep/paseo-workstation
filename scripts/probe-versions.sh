@@ -30,19 +30,19 @@ nuget_latest() {
     | jq -er '[.versions[] | select(test("-") | not)] | last'
 }
 image_digest() {
-  # Digest of the multi-arch index for public.ecr.aws/<repository>:<tag>.
-  local token
-  token=$(curl -fsSL "https://public.ecr.aws/token/?scope=repository:$1:pull" | jq -er .token)
-  curl -fsSI -H "Authorization: Bearer $token" \
+  # Digest of the multi-arch index for mirror.gcr.io/<repository>:<tag> (Google's
+  # mirror of Docker Hub's official images; public.ecr.aws throttled CI with 429s).
+  # Fails, and so stops the probe, unless a sha256 digest comes back.
+  curl -fsSI --retry 3 \
     -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-    "https://public.ecr.aws/v2/$1/manifests/$2" \
-    | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }'
+    "https://mirror.gcr.io/v2/$1/manifests/$2" \
+    | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }' | grep -E '^sha256:[0-9a-f]{64}$'
 }
 
-node_repository=docker/library/node
+node_repository=library/node
 node_tag=22-trixie-slim
 node_digest=$(image_digest "$node_repository" "$node_tag")
-golang_repository=docker/library/golang
+golang_repository=library/golang
 golang_tag=1-trixie
 golang_digest=$(image_digest "$golang_repository" "$golang_tag")
 # The Cloudflare DNS module publishes git tags, not GitHub releases.
@@ -61,8 +61,8 @@ rust_stable=$(curl -fsSL https://static.rust-lang.org/dist/channel-rust-stable.t
   | awk '/^\[pkg\.rust\]/ { found = 1 } found && !done && /^version = / { gsub(/"/, "", $3); print $3; done = 1 }')
 # (awk reads to the end: exiting early would make curl fail under pipefail.)
 
-emit NODE_IMAGE "public.ecr.aws/$node_repository:$node_tag@$node_digest"
-emit GOLANG_IMAGE "public.ecr.aws/$golang_repository:$golang_tag@$golang_digest"
+emit NODE_IMAGE "mirror.gcr.io/$node_repository:$node_tag@$node_digest"
+emit GOLANG_IMAGE "mirror.gcr.io/$golang_repository:$golang_tag@$golang_digest"
 emit DEBIAN_REFRESH "$(date -u +%G-W%V)"
 emit RUST_STABLE "$rust_stable"
 emit DOTNET8_SDK "$(dotnet_sdk 8.0)"
