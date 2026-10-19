@@ -166,23 +166,23 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
-      # Fixtures: a LAN-only proxy, an autostart hook that starts an upstream
-      # server, a site file for it, a static folder (with a dotfile that must
-      # stay hidden), a symlink that must be rejected, and a shutdown hook.
+      # Fixtures: the relay, an autostart hook that starts a loopback upstream
+      # server, a www/ folder (with a dotfile that must stay hidden), a symlink
+      # that must be rejected, and a shutdown hook.
       - name: Self-test a running container
         run: |
           set -Eeuo pipefail
           # Failures are reported as annotations too (readable without signing in).
           annotate() { local text; text="$(cat)"; text="${text//'%'/'%25'}"; echo "::error title=$1::${text//$'\n'/'%0A'}"; }
           trap 'rc=$?; trap - ERR; { echo "command: $BASH_COMMAND (exit $rc)"; docker logs smoke 2>&1 | grep -v "^{" | tail -n 30; } 2>&1 | annotate selftest-step' ERR
-          mkdir -p /tmp/smoke/home/.config/workstation /tmp/smoke/workspace/proxy/sites \
+          mkdir -p /tmp/smoke/home/.config/workstation \
             /tmp/smoke/workspace/proxy/www/hello /tmp/smoke/workspace/upstream
           cat > /tmp/smoke/home/.config/workstation/autostart <<'EOF'
           #!/bin/sh
           echo upstream-ok > /workspace/upstream/marker.txt
           cd /workspace/upstream && nohup python3 -m http.server 18999 --bind 127.0.0.1 > /dev/null 2>&1 &
           # A fake Gitea that only comes up now, after workstation-start's first tea
-          # login attempt: the same race as GITEA_URL served by the container's own proxy.
+          # login attempt: the race when Gitea isn't reachable yet at container start.
           nohup python3 /workspace/upstream/fake_gitea.py > /dev/null 2>&1 &
           touch "$HOME/autostart-ran"
           EOF
@@ -204,17 +204,12 @@ jobs:
           touch "$HOME/shutdown-ran"
           EOF
           chmod 755 /tmp/smoke/home/.config/workstation/*
-          printf '# check: /marker.txt\nimport proxy upstream 127.0.0.1:18999\n' > /tmp/smoke/workspace/proxy/sites/upstream.caddy
-          printf '# check: /\nimport proxy down 127.0.0.1:1\n' > /tmp/smoke/workspace/proxy/sites/down.caddy
-          echo 'import proxy hello.demo 127.0.0.1:18999' > /tmp/smoke/workspace/proxy/sites/hello.demo.caddy
-          mkdir -p /tmp/smoke/workspace/proxy/tcp
-          printf '# check: tcp\nimport forward 18080 127.0.0.1:18999\n' > /tmp/smoke/workspace/proxy/tcp/echo.caddy
           echo '<p>hello static</p>' > /tmp/smoke/workspace/proxy/www/hello/index.html
           echo 'SECRET=1' > /tmp/smoke/workspace/proxy/www/hello/.env
           ln -s /etc /tmp/smoke/workspace/proxy/www/escape
           sudo chown -R 568:568 /tmp/smoke
           docker run -d --name smoke --user 568:568 --shm-size 1g --security-opt no-new-privileges:true \
-            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_LAN_DOMAIN=selftest.lan -e PROXY_CHECK_INTERVAL=60 -e PROXY_RELAY_PORT=18890 -e PROXY_RELAY_TRUST=127.0.0.1 \
+            -e PASEO_PASSWORD=ci-self-test -e PASEO_RELAY_ENABLED=false -e PROXY_RELAY_PORT=18890 -e PROXY_RELAY_TRUST=127.0.0.1 \
             -e GITEA_URL=http://127.0.0.1:18998 -e GITEA_TOKEN=ci-dummy \
             -v /tmp/smoke/home:/home/paseo -v /tmp/smoke/workspace:/workspace \
             "$IMAGE:latest"
@@ -239,33 +234,27 @@ jobs:
             exit 1
           fi
 
-      - name: Proxy fixtures, autostart and a graceful stop
+      - name: Relay fixtures, autostart and a graceful stop
         run: |
           set -euo pipefail
-          get() { docker exec smoke curl -s -o /dev/null -w '%{http_code}' --resolve "$1.selftest.lan:80:127.0.0.1" "http://$1.selftest.lan$2"; }
           docker exec smoke workstation-proxy sites
           test -f /tmp/smoke/home/autostart-ran || { echo "::error::autostart hook did not run"; exit 1; }
           trap 'docker logs smoke 2>&1 | tail -n 30 | sed "s/^/  /"' ERR
-          [ "$(get upstream /marker.txt)" = 200 ] || { echo "::error::proxy to the autostarted upstream failed"; exit 1; }
-          [ "$(docker exec smoke curl -s -m 5 http://127.0.0.1:18080/marker.txt)" = upstream-ok ] \
-            || { echo "::error::TCP forward to the autostarted upstream failed"; exit 1; }
-          docker exec smoke workstation-proxy sites | grep -E '^echo +tcp'
-          # <service>.<host> sites: the site works, unknown services on that host get the
-          # 404 page, and a public domain would get one wildcard certificate per host.
-          [ "$(get hello.demo /marker.txt)" = 200 ] || { echo "::error::<service>.<host> site failed"; exit 1; }
-          [ "$(get nothing.demo /)" = 404 ] || { echo "::error::unknown service on a host did not 404"; exit 1; }
-          docker exec -e PROXY_DOMAIN=example.com -e CLOUDFLARE_API_TOKEN=ci-dummy -e XDG_STATE_HOME=/tmp/ci-show \
-            smoke workstation-proxy show | grep -F '*.demo.example.com {' \
-            || { echo "::error::no per-host wildcard block in the generated config"; exit 1; }
-          [ "$(get hello /)" = 200 ] || { echo "::error::static folder not served"; exit 1; }
-          [ "$(get hello /.env)" = 404 ] || { echo "::error::dotfile was served"; exit 1; }
-          # www/ folders for a proxy elsewhere: picked by the first label of the Host header.
+          # www/ folders: picked by the first label of the Host header.
           www() { docker exec smoke curl -s -o /dev/null -w '%{http_code}' -H "Host: $1" "http://127.0.0.1:18890$2"; }
           [ "$(docker exec smoke curl -s -H 'Host: hello.example.com' http://127.0.0.1:18890/)" = '<p>hello static</p>' ] \
-            || { echo "::error::www server did not serve the folder"; exit 1; }
-          [ "$(www hello.example.com /.env)" = 404 ] || { echo "::error::www server served a dotfile"; exit 1; }
-          [ "$(www escape.example.com /passwd)" = 404 ] || { echo "::error::www server served a rejected symlink"; exit 1; }
-          [ "$(www hello-evil.example.com /)" = 404 ] || { echo "::error::www server matched a look-alike name"; exit 1; }
+            || { echo "::error::relay did not serve the www folder"; exit 1; }
+          [ "$(www hello.example.com /.env)" = 404 ] || { echo "::error::relay served a dotfile"; exit 1; }
+          [ "$(www escape.example.com /passwd)" = 404 ] || { echo "::error::relay served a rejected symlink"; exit 1; }
+          [ "$(www hello-evil.example.com /)" = 404 ] || { echo "::error::relay matched a look-alike name"; exit 1; }
+          docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
+          # A new www/ folder is picked up by `reload --if-changed` (the supervisor runs it every minute);
+          # with nothing changed it does nothing.
+          docker exec smoke sh -c 'mkdir -p /workspace/proxy/www/later && echo later-ok > /workspace/proxy/www/later/index.html'
+          docker exec smoke workstation-proxy reload --if-changed | grep -Fx reloaded
+          [ "$(docker exec smoke curl -s -H 'Host: later.example.com' http://127.0.0.1:18890/)" = later-ok ] \
+            || { echo "::error::a new www folder was not picked up"; exit 1; }
+          [ -z "$(docker exec smoke workstation-proxy reload --if-changed)" ] || { echo "::error::reload --if-changed reloaded with nothing changed"; exit 1; }
           # Relay: a numeric X-Hq-Relay-Port forwards to that loopback port; other sources get 403.
           [ "$(docker exec smoke curl -s -H 'X-Hq-Relay-Port: 18999' http://127.0.0.1:18890/marker.txt)" = upstream-ok ] \
             || { echo "::error::relay did not forward to the loopback port"; exit 1; }
@@ -281,8 +270,8 @@ jobs:
           smoke_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' smoke)"
           [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Hq-Relay-Port: 18999' "http://$smoke_ip:18890/marker.txt")" = 403 ] \
             || { echo "::error::relay answered an untrusted source"; exit 1; }
-          [ "$(get escape /passwd)" = 404 ] || { echo "::error::rejected symlink was served"; exit 1; }
-          docker exec smoke workstation-proxy sites | grep -E '^escape +skipped'
+          # Retired proxy settings only warn.
+          docker exec -e PROXY_DOMAIN=example.com smoke workstation-proxy status | grep -F 'PROXY_DOMAIN no longer used'
           # tea: the first login attempt fails (fake Gitea not up yet); the background retry adds it.
           # The retry runs at most 30 s apart; allow three of those.
           # Capture first: `cmd | grep -q` fails under pipefail when grep exits early (SIGPIPE).
@@ -302,22 +291,6 @@ jobs:
             || { echo "::error::the first tea login attempt did not hit the race (test fixture problem)"; exit 1; }
           docker exec smoke grep -q 'login added on retry' /home/paseo/.paseo/workstation-startup-warnings.txt \
             || { echo "::error::tea retry did not record success"; exit 1; }
-          # Status checks: up, down, none (no check line) and the implicit static check.
-          # (Interval 60s: a result from before the upstream started is retried within it.)
-          for _ in $(seq 1 45); do
-            checks=$(docker exec smoke workstation-proxy checks)
-            grep -Eq '^up +site +upstream' <<< "$checks" && break
-            sleep 2
-          done
-          echo "$checks"
-          grep -Eq '^up +site +upstream ' <<< "$checks" || { echo "::error::upstream status check is not up"; exit 1; }
-          grep -Eq '^down +site +down ' <<< "$checks" || { echo "::error::down status check is not down"; exit 1; }
-          grep -Eq '^none +site +hello.demo ' <<< "$checks" || { echo "::error::site without a check is not none"; exit 1; }
-          grep -Eq '^up +static +hello ' <<< "$checks" || { echo "::error::static folder check is not up"; exit 1; }
-          grep -Eq '^up +tcp +echo ' <<< "$checks" || { echo "::error::tcp status check is not up"; exit 1; }
-          docker exec smoke curl -fsS --resolve sites.selftest.lan:80:127.0.0.1 http://sites.selftest.lan/status.json \
-            | jq -e '.checks["site:upstream"].state == "up"' > /dev/null \
-            || { echo "::error::status.json is not served on the sites page"; exit 1; }
           start=$SECONDS
           docker stop -t 120 smoke
           took=$((SECONDS - start))

@@ -12,8 +12,8 @@
 #
 # .env: PASEO_PASSWORD (required); GITEA_URL, GITEA_USER, GITEA_TOKEN;
 # MCPHUB_KEY, MCP_HOMELAB_URL (MCPHub); GH_TOKEN, GIT_USER_NAME,
-# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG; proxy: PROXY_DOMAIN,
-# PROXY_LAN_DOMAIN, PROXY_BIND, CLOUDFLARE_API_TOKEN, PROXY_MANAGE_DNS.
+# GIT_USER_EMAIL, PASEO_MEM_LIMIT, PASEO_IMAGE_TAG; relay:
+# PROXY_RELAY_PORT, PROXY_RELAY_TRUST, PROXY_BIND.
 services:
   paseo:
     image: ghcr.io/realbeepmcjeep/paseo-workstation:${PASEO_IMAGE_TAG:-latest}
@@ -39,13 +39,12 @@ services:
       # Agents get an mcphub entry only when MCPHUB_KEY is set.
       MCP_HOMELAB_URL: ${MCP_HOMELAB_URL:-}
       MCPHUB_TOKEN: ${MCPHUB_KEY:-}
-      # Optional subdomain proxy (see README): off unless a domain is set.
-      PROXY_DOMAIN: ${PROXY_DOMAIN:-}
-      PROXY_LAN_DOMAIN: ${PROXY_LAN_DOMAIN:-}
+      # Behind the subdomain proxy, also set PASEO_HOSTNAMES: paseo.example.com
+      # (unset or empty means Paseo's default host check).
+      # Relay for the subdomain proxy on another box (see README): off unless a port is set.
+      PROXY_RELAY_PORT: ${PROXY_RELAY_PORT:-}
+      PROXY_RELAY_TRUST: ${PROXY_RELAY_TRUST:-}
       PROXY_BIND: ${PROXY_BIND:-}
-      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
-      # true: create missing *.<host> DNS records for <service>.<host> sites.
-      PROXY_MANAGE_DNS: ${PROXY_MANAGE_DNS:-}
     volumes:
       # rslave: new ZFS snapshots appear under .zfs/snapshot without a restart.
       - type: bind

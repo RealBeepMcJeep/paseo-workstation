@@ -45,12 +45,6 @@ node_digest=$(image_digest "$node_repository" "$node_tag")
 golang_repository=library/golang
 golang_tag=1-trixie
 golang_digest=$(image_digest "$golang_repository" "$golang_tag")
-# The Cloudflare DNS module publishes git tags, not GitHub releases.
-caddy_cloudflare=$(git ls-remote --tags --refs https://github.com/caddy-dns/cloudflare.git \
-  | awk -F/ '{ print $3 }' | sort -V | tail -n 1)
-# caddy-l4 (TCP forwarding for the proxy) also publishes only git tags.
-caddy_l4=$(git ls-remote --tags --refs https://github.com/mholt/caddy-l4.git \
-  | awk -F/ '{ print $3 }' | sort -V | tail -n 1)
 
 dotnet_index=$(curl -fsSL https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json)
 dotnet_sdk() { jq -er --arg c "$1" '."releases-index"[] | select(."channel-version" == $c) | ."latest-sdk"' <<<"$dotnet_index"; }
@@ -85,8 +79,6 @@ emit GH_SHA256 "$(asset_sha256 "$gh" "gh_${gh_version#v}_linux_amd64.tar.gz")"
 emit TEA_VERSION "$(curl -fsSL https://gitea.com/api/v1/repos/gitea/tea/releases/latest | jq -er .tag_name)"
 emit CADDY_VERSION "$(github_latest caddyserver/caddy)"
 emit XCADDY_VERSION "$(github_latest caddyserver/xcaddy)"
-emit CADDY_CLOUDFLARE_VERSION "$caddy_cloudflare"
-emit CADDY_L4_VERSION "$caddy_l4"
 emit PYRIGHT_VERSION "$(npm_latest pyright)"
 emit TS_LS_VERSION "$(npm_latest typescript-language-server)"
 emit TYPESCRIPT_VERSION "$(npm_latest typescript '^6')"

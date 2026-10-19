@@ -21,7 +21,7 @@ Updating is meant to be just a redeploy (Komodo **Deploy**, or Dockge **Update**
 | TS/JS | Node 22, typescript-language-server, TypeScript 6 |
 | Language servers for Claude | pyright, csharp-ls, rust-analyzer, typescript-language-server, marksman (Markdown), yaml-language-server (with Compose and GitHub Actions schemas). Loaded from image-owned plugins in `/opt/claude-plugins` |
 | CLI tools | git, gh, tea (Gitea), jq, yq, ripgrep, fd, sqlite3, tree, shellcheck, ffmpeg, pdftotext, tmux, build-essential, cmake |
-| Proxy (optional, off by default) | Caddy with the Cloudflare DNS and caddy-l4 modules: subdomains for projects, static folders, TCP port forwards, a sites index with status checks, and automatic HTTPS. See below |
+| Relay (optional, off by default) | A small Caddy that lets a proxy on another box ([hq-caddy](https://github.com/RealBeepMcJeep/hq-caddy)) reach loopback-only services and static folders in this container. See below |
 
 Exact versions of the running image are in `/etc/paseo-workstation/versions.txt`.
 
@@ -83,9 +83,8 @@ What startup manages (in `rootfs/usr/local/bin/workstation-start` and
   the environment and stores nothing.
 - A `tea` login refreshed from `GITEA_TOKEN` on each start. It is stored in a
   0600 file, because tea cannot log in from the environment. tea checks the
-  token against Gitea, so if Gitea isn't reachable yet (for example when
-  `GITEA_URL` is served by this container's own proxy), the login is retried in
-  the background for about 10 minutes.
+  token against Gitea, so if Gitea isn't reachable yet at start, the login is
+  retried in the background for about 10 minutes.
 - MCP entries `mcphub` (Claude, Codex, Pi; only when `MCPHUB_KEY` is set) and
   `bladebro` (Claude, Codex). Configs reference `${MCPHUB_TOKEN}`, never the
   key. Pi keeps its own bladebro extension.
@@ -100,12 +99,12 @@ Startup problems never stop the container. Check
 ## Lifecycle and hooks
 
 `tini` runs `workstation-start` (setup), which hands over to
-`workstation-supervise`. That process runs Paseo, the optional proxy and the
+`workstation-supervise`. That process runs Paseo, the optional relay and the
 optional hooks, and on Stop/Update shuts them down in order:
 
 1. `~/.config/workstation/shutdown` (if present and executable) runs first, with up
    to 75 seconds, for example to stop project services cleanly.
-2. The proxy stops gracefully.
+2. The relay stops gracefully.
 3. Paseo stops gracefully.
 
 `~/.config/workstation/autostart` (if present and executable) runs once in the
@@ -114,32 +113,27 @@ services after an Update. Both hooks log to `~/.paseo/autostart.log`, rotated at
 1 MiB. Neither can block Paseo from starting. Compose allows 120 seconds for the
 whole stop.
 
-## Optional subdomain proxy
+## Optional relay for a proxy elsewhere
 
-Off unless at least one domain is set in the stack's environment:
+Subdomains (`https://<name>.example.com`) are served by a proxy on its own box,
+[hq-caddy](https://github.com/RealBeepMcJeep/hq-caddy), which takes its sites from a
+Git repository. So restarting this container takes down only the sites it hosts. For
+services here that listen only on `127.0.0.1`, that proxy goes through this relay:
 
 | Setting | Effect |
 |---|---|
-| `PROXY_DOMAIN=example.com` | `https://<name>.example.com` with a Let's Encrypt wildcard certificate, using Cloudflare DNS validation. Needs `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_API_TOKEN_FILE`) with DNS edit on that zone. Point a DNS-only `*` record at the container's address |
-| `PROXY_LAN_DOMAIN=home.lan` | `http://<name>.home.lan` and `https://<name>.home.lan` (Caddy's internal CA). Point a local DNS wildcard at the container |
-| `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
-| `PROXY_CONFIG_DIR` | Project files (default `/workspace/proxy`) |
-| `PROXY_MANAGE_DNS=true` | For each `<service>.<host>` site, create the Cloudflare record `*.<host>.example.com` → `PROXY_DNS_TARGET` (default: first `PROXY_BIND`) if it's missing. Create-only: never edits or deletes records |
-| `PROXY_CHECK_INTERVAL=300` | Seconds between status checks of one site (minimum 60). Checks are `# check:` lines in site files; results are dots on the sites page. The same interval refreshes the page's list of local DNS records |
-| `PROXY_RELAY_PORT=8800` | A relay for a proxy running elsewhere (hq-caddy's `import relay`): plain HTTP on this port, answering only `PROXY_RELAY_TRUST`. With a numeric `X-Hq-Relay-Port` header it forwards to `127.0.0.1:<port>`, so services can stay loopback-only; without one it serves `www/<name>/` by the first label of the requested name. Without `PROXY_DOMAIN`/`PROXY_LAN_DOMAIN`, only the relay runs (no sites, no TCP forwards); `workstation-proxy check` still validates site files |
+| `PROXY_RELAY_PORT=8800` | Plain HTTP on this port. A numeric `X-Hq-Relay-Port` header (hq-caddy `relay`) forwards to `127.0.0.1:<port>`; `X-Hq-Relay-Root` (hq-caddy `relay_root`) serves that folder, if it is under `/workspace` with no hidden path parts; otherwise (hq-caddy `relay_files`) `www/<name>/` by the first label of the requested name. Off while unset |
 | `PROXY_RELAY_TRUST=192.0.2.10` | The proxy's address(es), comma- or space-separated. Everyone else gets 403 (everyone, while unset). Their `X-Forwarded-*` headers are kept, so apps that trust loopback still see `https` |
+| `PROXY_BIND=192.0.2.10` | Listen only on these addresses (comma- or space-separated). Default: all |
+| `PROXY_CONFIG_DIR` | Folder holding `www/` (default `/workspace/proxy`) |
 
-Projects add `sites/<name>.caddy` (for example `import proxy myapp 127.0.0.1:5173`),
-drop static files in `www/<name>/`, or forward a raw TCP port with
-`tcp/<name>.caddy` (for example `import forward 22 192.0.2.20:2222`, through the
-caddy-l4 plugin), then run `workstation-proxy reload`. The
-image seeds `README.md` into that folder with the details. `paseo.<domain>` serves
-the Paseo UI, and `sites.<domain>` lists every site and offers the internal CA root.
-Site files named `<service>.<host>.caddy` (e.g. `dockge.nas.caddy` →
-`https://dockge.nas.example.com`) share one wildcard certificate per host
-(`*.nas.example.com`). Only the first service on a new host waits for a
-certificate. Certificates and the CA live in `~/.local/share/caddy`. A broken project file never
-replaces a working configuration.
+`www/<name>/` folders (or symlinks to build output under `/workspace`) are picked up
+within a minute; dotfiles are never served. `workstation-proxy status` and
+`workstation-proxy sites` show what the relay serves and skips. Set `PASEO_HOSTNAMES`
+(e.g. `paseo.example.com`) so Paseo accepts its UI through the proxy.
+
+Earlier images ran the whole proxy here (`PROXY_DOMAIN`, `PROXY_LAN_DOMAIN`, Cloudflare
+DNS, TCP forwards, a sites page). Those settings are now ignored with a warning.
 
 ## Checking a deployment
 
@@ -149,10 +143,9 @@ docker exec paseo workstation-selftest
 
 This checks Paseo health, Chromium, the bladebro MCP handshake, Rust native and
 WASM builds, net8.0 and SDK-style net48 builds with an ilspycmd round trip,
-pyright/ruff, tsc and shellcheck, and reports memory use. When the proxy is
-enabled it also checks the sites index, the Paseo UI through the proxy, the 404
-page, and HTTPS on each configured domain. It uses a scratch directory and needs
-no credentials.
+pyright/ruff, tsc and shellcheck, and reports memory use. When the relay is
+enabled it also checks that it runs and answers. It uses a scratch directory and
+needs no credentials.
 
 ## Rollback
 
@@ -167,8 +160,7 @@ restore the home dataset snapshot while the stack is stopped.
 
 The repository and image are public and contain no credentials. Tokens come
 only from the stack's environment (`.env`) at runtime: `PASEO_PASSWORD`, `GITEA_TOKEN`,
-`GH_TOKEN`, `MCPHUB_KEY` and `CLOUDFLARE_API_TOKEN`. Agent logins and proxy
-certificates live in the home dataset.
+`GH_TOKEN` and `MCPHUB_KEY`. Agent logins live in the home dataset.
 
 ## Changing the image
 
