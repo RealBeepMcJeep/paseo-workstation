@@ -373,6 +373,7 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
         # The relay for a proxy elsewhere: only PROXY_RELAY_TRUST may use it. A numeric
         # X-Hq-Relay-Port picks a loopback port; X-Hq-Relay-Root a folder under /workspace
         # (no ".." or hidden parts); otherwise www/<name>/ by the Host's first label.
+        # A pass-through hop: flush every write so streams aren't held back.
         out += ["# Relay for a proxy running elsewhere (hq-caddy `import relay`)",
                 f"http://:{cfg['relay_port']} {{", "\troute {"]
         if cfg["relay_trust"]:
@@ -380,7 +381,8 @@ def caddyfile(cfg, sites, static, tcp, include_sites=True):
         else:
             out += ['\t\trespond "Forbidden: PROXY_RELAY_TRUST is not set" 403']
         out += ["\t\t@port header_regexp X-Hq-Relay-Port ^[0-9]{1,5}$",
-                "\t\treverse_proxy @port 127.0.0.1:{header.X-Hq-Relay-Port} {", "\t\t\theader_up -X-Hq-Relay-Port", "\t\t}",
+                "\t\treverse_proxy @port 127.0.0.1:{header.X-Hq-Relay-Port} {", "\t\t\theader_up -X-Hq-Relay-Port",
+                "\t\t\tflush_interval -1", "\t\t}",
                 "\t\t@root header_regexp X-Hq-Relay-Root ^/workspace(/[A-Za-z0-9_@+=-][A-Za-z0-9._@+=-]*)+/?$",
                 "\t\thandle @root {", "\t\t\timport static_files {header.X-Hq-Relay-Root}", "\t\t}"]
         for index, item in enumerate(static):
