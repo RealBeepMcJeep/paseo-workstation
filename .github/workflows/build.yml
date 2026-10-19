@@ -269,6 +269,15 @@ jobs:
           # Relay: a numeric X-Hq-Relay-Port forwards to that loopback port; other sources get 403.
           [ "$(docker exec smoke curl -s -H 'X-Hq-Relay-Port: 18999' http://127.0.0.1:18890/marker.txt)" = upstream-ok ] \
             || { echo "::error::relay did not forward to the loopback port"; exit 1; }
+          # Relay root: a folder under /workspace named by X-Hq-Relay-Root; never dotfiles or "..".
+          docker exec smoke sh -c 'mkdir -p /workspace/ci-root/sub /workspace/ci-root/.git && echo root-ok > /workspace/ci-root/sub/page.txt && echo no > /workspace/ci-root/.git/config'
+          root() { docker exec smoke curl -s -o /dev/null -w '%{http_code}' -H "X-Hq-Relay-Root: $1" "http://127.0.0.1:18890$2"; }
+          [ "$(docker exec smoke curl -s -H 'X-Hq-Relay-Root: /workspace/ci-root' http://127.0.0.1:18890/sub/page.txt)" = root-ok ] \
+            || { echo "::error::relay did not serve the relay root"; exit 1; }
+          [ "$(root /workspace/ci-root /.git/config)" = 404 ] || { echo "::error::relay root served a dotfile"; exit 1; }
+          [ "$(root /workspace/ci-root/.git /config)" = 404 ] || { echo "::error::relay root accepted a hidden folder"; exit 1; }
+          [ "$(root /workspace/ci-root/../ci-root /sub/page.txt)" = 404 ] || { echo "::error::relay root accepted .."; exit 1; }
+          [ "$(root /etc /passwd)" = 404 ] || { echo "::error::relay root left /workspace"; exit 1; }
           smoke_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' smoke)"
           [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Hq-Relay-Port: 18999' "http://$smoke_ip:18890/marker.txt")" = 403 ] \
             || { echo "::error::relay answered an untrusted source"; exit 1; }
