@@ -1,9 +1,9 @@
 #!/bin/bash
 # Lifecycle owner, started by workstation-start under tini. It runs Paseo, the
-# optional Caddy proxy (workstation-proxy) with its status checks, and the
-# optional autostart hook. On
-# Stop/Update (SIGTERM) it runs the optional shutdown hook, then stops the proxy
-# and Paseo cleanly, all within compose's stop_grace_period (120s).
+# optional relay for the *.<domain> proxy (workstation-proxy, a small Caddy), and
+# the optional autostart hook. On Stop/Update (SIGTERM) it runs the optional
+# shutdown hook, then stops the relay and Paseo cleanly, all within compose's
+# stop_grace_period (120s).
 #
 # Optional hooks, executable files owned by the user (never required):
 #   ~/.config/workstation/autostart  runs once after Paseo answers its health check
@@ -17,7 +17,7 @@ hook_log="$PASEO_HOME/autostart.log"
 paseo_port="${PASEO_LISTEN##*:}"
 stopping=0
 proxy_pid=""
-checks_pid=""
+www_pid=""
 autostart_pid=""
 trap 'stopping=1' TERM INT
 
@@ -51,41 +51,32 @@ proxy_loop() {
     caddy_pid=$!
     wait "$caddy_pid"
     [ "$quit" -eq 1 ] && { wait_gone "$caddy_pid" 15 || kill -KILL "$caddy_pid" 2> /dev/null; break; }
-    say "proxy exited; restarting in 5s (see: workstation-proxy status)"
+    say "relay exited; restarting in 5s (see: workstation-proxy status)"
     sleep 5 &
     wait $!
   done
 }
 
-checks_loop() {
-  # Every minute, run the status checks that are due. workstation-proxy limits each
-  # entry to one check per PROXY_CHECK_INTERVAL and never runs two at once.
+www_loop() {
+  # Every minute, pick up added, removed or changed www/ folders (no-op otherwise).
   trap 'exit 0' TERM
   sleep 20 &
   wait $!
   while :; do
-    workstation-proxy checks --quiet > /dev/null
+    workstation-proxy reload --if-changed > /dev/null
     sleep 60 &
     wait $!
   done
 }
 
-if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}" ]; then
-  # Let Paseo accept its web UI through the proxy at paseo.<domain>.
-  for domain in ${PROXY_DOMAIN:-} ${PROXY_LAN_DOMAIN:-}; do
-    PASEO_HOSTNAMES="${PASEO_HOSTNAMES:+$PASEO_HOSTNAMES,}paseo.$domain"
-  done
-  export PASEO_HOSTNAMES
-fi
-
 node "$(cat /etc/paseo-server-entry)" "$@" &
 paseo_pid=$!
 
-if [ -n "${PROXY_DOMAIN:-}${PROXY_LAN_DOMAIN:-}${PROXY_RELAY_PORT:-}" ]; then
+if [ -n "${PROXY_RELAY_PORT:-}" ]; then
   proxy_loop &
   proxy_pid=$!
-  checks_loop &
-  checks_pid=$!
+  www_loop &
+  www_pid=$!
 fi
 
 if [ -x "$hooks/autostart" ]; then
@@ -113,7 +104,7 @@ fi
 
 say "stopping"
 [ -n "$autostart_pid" ] && kill -TERM "$autostart_pid" 2> /dev/null
-[ -n "$checks_pid" ] && kill -TERM "$checks_pid" 2> /dev/null
+[ -n "$www_pid" ] && kill -TERM "$www_pid" 2> /dev/null
 run_hook shutdown 75
 if [ -n "$proxy_pid" ]; then
   kill -TERM "$proxy_pid" 2> /dev/null

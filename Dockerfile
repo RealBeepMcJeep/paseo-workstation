@@ -12,20 +12,15 @@
 ARG NODE_IMAGE=mirror.gcr.io/library/node:22-trixie-slim
 ARG GOLANG_IMAGE=mirror.gcr.io/library/golang:1-trixie
 
-# Caddy for the optional subdomain proxy (workstation-proxy), built with the
-# Cloudflare DNS module and caddy-l4 (TCP forwarding) at exact versions. Go verifies every module download
-# against its checksum database (sum.golang.org).
+# Caddy for the relay to the *.<domain> proxy (workstation-proxy), built from source
+# at an exact version; no extra modules. Go verifies every module download against
+# its checksum database (sum.golang.org).
 FROM ${GOLANG_IMAGE} AS caddy
 ARG CADDY_VERSION
 ARG XCADDY_VERSION
-ARG CADDY_CLOUDFLARE_VERSION
-ARG CADDY_L4_VERSION
-RUN : "${CADDY_VERSION:?}" "${XCADDY_VERSION:?}" "${CADDY_CLOUDFLARE_VERSION:?}" "${CADDY_L4_VERSION:?}" \
+RUN : "${CADDY_VERSION:?}" "${XCADDY_VERSION:?}" \
     && go install "github.com/caddyserver/xcaddy/cmd/xcaddy@${XCADDY_VERSION}" \
-    && CGO_ENABLED=0 xcaddy build "$CADDY_VERSION" \
-         --with "github.com/caddy-dns/cloudflare@${CADDY_CLOUDFLARE_VERSION}" \
-         --with "github.com/mholt/caddy-l4@${CADDY_L4_VERSION}" \
-         --output /caddy
+    && CGO_ENABLED=0 xcaddy build "$CADDY_VERSION" --output /caddy
 
 FROM ${NODE_IMAGE}
 

@@ -1,76 +1,44 @@
 #!/usr/bin/python3
-"""workstation-proxy: the optional Caddy subdomain proxy of the Paseo workstation.
+"""workstation-proxy: the relay between the *.<domain> proxy (hq-caddy, on its own box)
+and this container.
 
-Off unless PROXY_DOMAIN and/or PROXY_LAN_DOMAIN is set. Settings (environment):
-  PROXY_DOMAIN               public domain: <name>.<domain> over HTTPS with a
-                             Let's Encrypt wildcard via Cloudflare DNS-01
-  CLOUDFLARE_API_TOKEN       Cloudflare token (Zone DNS edit), or
-  CLOUDFLARE_API_TOKEN_FILE  a file holding it
-  PROXY_LAN_DOMAIN           local-only domain: http://<name>.<lan> and
-                             https://<name>.<lan> (Caddy's internal CA)
-  PROXY_BIND                 addresses to listen on, comma/space separated
-                             (default: all interfaces)
-  PROXY_CONFIG_DIR           project files (default /workspace/proxy):
-                             sites/<name>.caddy, www/<name>/ and
-                             tcp/<name>.caddy (raw TCP forwards)
-  PROXY_HTTP_PORT/PROXY_HTTPS_PORT  listener ports (default 80/443)
-  PROXY_STATIC_ALLOWED       symlinks in www/ must point inside this (default /workspace)
-  PROXY_ADMIN                Caddy admin API address (default localhost:2019)
-  PROXY_MANAGE_DNS           true: for every <service>.<host> site file, make sure a
-                             Cloudflare record *.<host>.<domain> -> PROXY_DNS_TARGET
-                             exists (create-only; never edits or deletes records)
-  PROXY_DNS_TARGET           address for those records (default: first PROXY_BIND)
-  PROXY_CHECK_INTERVAL       seconds between status checks of one site (default 300, min 60)
-  PROXY_RELAY_PORT           a relay for a proxy running elsewhere (hq-caddy `relay`):
-                             plain HTTP on this port, answering only PROXY_RELAY_TRUST.
-                             With a numeric X-Hq-Relay-Port header it forwards to
-                             127.0.0.1:<port>; with X-Hq-Relay-Root (hq-caddy
-                             `relay_root`) it serves that folder, if it is under
-                             /workspace and no part of its path starts with a dot;
-                             otherwise www/<name>/ by the first label of the Host
-                             header. Works with or without the domains above;
-                             without them, only the relay runs.
+The proxy itself runs elsewhere and takes its sites from Git (homelab-proxy). It reaches
+services that listen only on this container's loopback, and the static folders here,
+through this relay. Off unless PROXY_RELAY_PORT is set. Settings (environment):
+  PROXY_RELAY_PORT           plain HTTP on this port, answering only PROXY_RELAY_TRUST:
+                             - a numeric X-Hq-Relay-Port header (hq-caddy `relay`)
+                               forwards to 127.0.0.1:<port>;
+                             - X-Hq-Relay-Root (hq-caddy `relay_root`) serves that
+                               folder, if it is under /workspace and no part of its
+                               path starts with a dot;
+                             - otherwise (hq-caddy `relay_files`) www/<name>/ by the
+                               first label of the Host header.
   PROXY_RELAY_TRUST          the proxy's address(es), comma/space separated; everyone
                              else gets 403 (all of them while this is unset). Their
                              X-Forwarded-* headers are kept, so apps still see https.
+  PROXY_BIND                 addresses to listen on, comma/space separated (default: all)
+  PROXY_CONFIG_DIR           folder holding www/ (default /workspace/proxy)
+  PROXY_STATIC_ALLOWED       symlinks in www/ must point inside this (default /workspace)
+  PROXY_ADMIN                Caddy admin API address (default localhost:2019)
 
-Site files named <service>.<host>.caddy also get one wildcard certificate per host
-(*.<host>.<domain>), so further services on that host need no new certificate.
-
-A `# check: ...` line in a site or tcp file defines its status check, shown as a
-dot on the sites page (green up, yellow checking/unsure, red down, black none):
-  # check: /health [codes]   GET through the proxy (default codes 200-399)
-  # check: https://...       GET an absolute URL
-  # check: tcp [host:port]   TCP connect (default: the file's upstream)
-  # check: run <command>     exit 0 up, 1 down, other unsure; first output line is the note
-With a public domain, the page also lists the zone's records that point to private
-addresses (refreshed from Cloudflare at the same interval).
+www/<name>/ folders are picked up within a minute (the supervisor runs
+`reload --if-changed`). Dotfiles are never served.
 
 Commands:
-  check    build and validate the configuration without applying it
-  show     print the generated Caddy configuration (no secrets)
-  reload   rebuild, validate, and apply it; the running config stays on failure
-  sites    list published sites and skipped entries
-  status   show whether the proxy is disabled, running or failing
+  status   whether the relay runs, what it serves, and the last error
+  sites    list the www/ folders it serves and the ones it skips (with the reason)
+  reload   rebuild, validate and apply (--if-changed: only when www/ changed)
+  show     print the generated Caddy configuration
   logs     show recent Caddy log lines (-n N)
-  checks   run the status checks that are due, then list every state
-  ca       show where to get the internal CA root certificate
   run      (used by the image's supervisor) build and run Caddy in the foreground
 """
-import fcntl
-import html
-import ipaddress
 import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
-import time
-import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HOME = Path(os.environ.get("HOME", "/home/paseo"))
@@ -80,18 +48,10 @@ CANDIDATE = STATE / "candidate"
 LOG = STATE / "caddy.log"
 ERROR = STATE / "last-error.txt"
 REPORT = STATE / "report.json"
-STATUS = STATE / "status.json"
-DNS_LIST = STATE / "dns.json"
-CHECK_LOCK = STATE / "checks.lock"
-CA_ROOT = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "caddy/pki/authorities/local/root.crt"
-TEMPLATE_README = Path("/usr/local/share/workstation-proxy/README.md")
 WORKSPACE = Path(os.environ.get("PROXY_STATIC_ALLOWED", "/workspace"))
 ADMIN = os.environ.get("PROXY_ADMIN", "localhost:2019")  # Caddy admin API (loopback)
-RESERVED = {"paseo", "sites"}
 NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
-CHECK_LINE = re.compile(r"^\s*#\s*check:\s*(.*?)\s*$", re.M)
-CHECK_TIMEOUT = 10  # seconds per check
-DOMAIN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+RETIRED = ("PROXY_DOMAIN", "PROXY_LAN_DOMAIN", "PROXY_MANAGE_DNS", "PROXY_DNS_TARGET", "PROXY_CHECK_INTERVAL")
 
 
 def env(name, default=""):
@@ -99,57 +59,20 @@ def env(name, default=""):
 
 
 def settings():
-    public = env("PROXY_DOMAIN").lower().rstrip(".")
-    lan = env("PROXY_LAN_DOMAIN").lower().rstrip(".")
-    problems = []
-    for label, value in (("PROXY_DOMAIN", public), ("PROXY_LAN_DOMAIN", lan)):
-        if value and not DOMAIN.match(value):
-            problems.append(f"{label} is not a valid domain name; ignored")
-    public = public if public and DOMAIN.match(public) else ""
-    lan = lan if lan and DOMAIN.match(lan) else ""
-    if public and not token():
-        problems.append("PROXY_DOMAIN is set but no CLOUDFLARE_API_TOKEN(_FILE): public HTTPS disabled")
-        public = ""
-    paseo_port = env("PASEO_LISTEN", "0.0.0.0:6767").rsplit(":", 1)[-1]
-    interval = env("PROXY_CHECK_INTERVAL", "300")
+    retired = [name for name in RETIRED if env(name)]
+    problems = [f"{', '.join(retired)} no longer used: this image only runs the relay "
+                "(the proxy is hq-caddy, configured through homelab-proxy)"] if retired else []
     return {
-        "public": public,
-        "lan": lan,
         "bind": [a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if a],
-        "http_port": env("PROXY_HTTP_PORT", "80"),
-        "https_port": env("PROXY_HTTPS_PORT", "443"),
         "config": Path(env("PROXY_CONFIG_DIR", "/workspace/proxy")),
-        "paseo_port": paseo_port if paseo_port.isdigit() else "6767",
-        "check_interval": max(60, int(interval)) if interval.isdigit() else 300,
-        "manage_dns": env("PROXY_MANAGE_DNS").lower() in ("1", "true", "yes", "on"),
         "relay_port": env("PROXY_RELAY_PORT") if env("PROXY_RELAY_PORT").isdigit() else "",
         "relay_trust": [a for a in re.split(r"[,\s]+", env("PROXY_RELAY_TRUST")) if a],
-        "dns_target": env("PROXY_DNS_TARGET") or next(
-            (a for a in re.split(r"[,\s]+", env("PROXY_BIND")) if re.fullmatch(r"[0-9.]+", a)), ""),
         "problems": problems,
     }
 
 
 def enabled():
-    return bool(env("PROXY_DOMAIN") or env("PROXY_LAN_DOMAIN") or env("PROXY_RELAY_PORT"))
-
-
-def token():
-    if env("CLOUDFLARE_API_TOKEN"):
-        return env("CLOUDFLARE_API_TOKEN")
-    path = env("CLOUDFLARE_API_TOKEN_FILE")
-    try:
-        return Path(path).read_text().strip() if path else ""
-    except OSError:
-        return ""
-
-
-def caddy_env():
-    """Environment for Caddy: the token is passed by variable, never written to config."""
-    environment = dict(os.environ)
-    if token():
-        environment["CLOUDFLARE_API_TOKEN"] = token()
-    return environment
+    return bool(settings()["relay_port"])
 
 
 # ----- static folders --------------------------------------------------------
@@ -185,109 +108,22 @@ def check_static(entry):
 
 
 def collect(cfg):
-    """Find site files and static folders; decide what is served and what is skipped."""
-    sites_dir, www_dir = cfg["config"] / "sites", cfg["config"] / "www"
-    sites, static, skipped = [], [], []
-    for path in sorted(sites_dir.glob("*.caddy")) if sites_dir.is_dir() else []:
-        name = path.stem
-        if name in RESERVED:
-            skipped.append({"name": name, "source": f"sites/{path.name}", "reason": "reserved name"})
-        else:
-            sites.append({"name": name, "source": f"sites/{path.name}", "path": str(path), "check": check_line(path)})
-    taken = {s["name"] for s in sites} | RESERVED
+    """The www/ folders: which are served and which are skipped (with the reason)."""
+    www_dir = cfg["config"] / "www"
+    static, skipped = [], []
     for entry in sorted(www_dir.iterdir()) if www_dir.is_dir() else []:
         name = entry.name
         if name.startswith("."):
             continue
         if not NAME.match(name):
             skipped.append({"name": name, "source": f"www/{name}", "reason": "invalid name (a-z, 0-9, -)"})
-        elif name in taken:
-            reason = "reserved name" if name in RESERVED else "a site file with this name takes precedence"
-            skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
+            continue
+        root, reason = check_static(entry)
+        if root:
+            static.append({"name": name, "source": f"www/{name}", "root": str(root)})
         else:
-            root, reason = check_static(entry)
-            if root:
-                static.append({"name": name, "source": f"www/{name}", "root": str(root), "check": "static folder"})
-            else:
-                skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
-    tcp_dir = cfg["config"] / "tcp"
-    tcp = [{"name": path.stem, "source": f"tcp/{path.name}", "path": str(path), "ports": forward_ports(path),
-            "check": check_line(path)}
-           for path in (sorted(tcp_dir.glob("*.caddy")) if tcp_dir.is_dir() else [])]
-    return sites, static, skipped, tcp
-
-
-def check_line(path):
-    """The status check defined by a `# check: ...` line ("" when there is none)."""
-    try:
-        found = CHECK_LINE.search(Path(path).read_text())
-    except OSError:
-        return ""
-    return found.group(1) if found else ""
-
-
-def forward_ports(path):
-    """Ports named by `import forward PORT UPSTREAM` lines (for listings only)."""
-    try:
-        return [f"{m.group(1)} -> {m.group(2)}" for m in
-                re.finditer(r"^\s*import\s+forward\s+(\d+)\s+(\S+)", path.read_text(), re.M)]
-    except OSError:
-        return []
-
-
-def hosts(sites):
-    """Hosts named by <service>.<host> site files, e.g. dockge.truenas -> truenas."""
-    found = {item["name"].split(".", 1)[1] for item in sites if "." in item["name"]}
-    return sorted(h for h in found if DOMAIN.match(h))
-
-
-def cloudflare(method, path, data=None):
-    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
-                                 data=json.dumps(data).encode() if data is not None else None,
-                                 headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        return json.load(error)
-
-
-def zone_id(cfg):
-    """Cloudflare zone of PROXY_DOMAIN; the zone may be a parent of it."""
-    labels = cfg["public"].split(".")
-    for i in range(len(labels) - 1):
-        found = cloudflare("GET", "/zones?name=" + ".".join(labels[i:])).get("result") or []
-        if found:
-            return found[0]["id"]
-    return None
-
-
-def ensure_dns(cfg, names):
-    """Create missing *.<host>.<domain> A records. Create-only; returns per-host results."""
-    if not (cfg["manage_dns"] and cfg["public"] and names):
-        return []
-    if not cfg["dns_target"]:
-        return [{"name": "*", "state": "error: set PROXY_DNS_TARGET (or an IPv4 PROXY_BIND)"}]
-    results = []
-    try:
-        zone = zone_id(cfg)
-        if not zone:
-            return [{"name": "*", "state": f"error: no Cloudflare zone found for {cfg['public']}"}]
-        for host in names:
-            fqdn = f"*.{host}.{cfg['public']}"
-            existing = cloudflare("GET", f"/zones/{zone}/dns_records?name={fqdn}").get("result") or []
-            if existing:
-                results.append({"name": fqdn, "state": "exists"})
-                continue
-            made = cloudflare("POST", f"/zones/{zone}/dns_records", {
-                "type": "A", "name": fqdn, "content": cfg["dns_target"], "proxied": False, "ttl": 1,
-                "comment": f"workstation-proxy: services on {host} (<service>.{host}.{cfg['public']})"})
-            state = "created" if made.get("success") else "error: " + "; ".join(
-                e.get("message", "?") for e in made.get("errors", []))
-            results.append({"name": fqdn, "state": state})
-    except (OSError, ValueError) as error:
-        results.append({"name": "*", "state": f"error: {type(error).__name__}"})
-    return results
+            skipped.append({"name": name, "source": f"www/{name}", "reason": reason})
+    return static, skipped
 
 
 # ----- configuration ---------------------------------------------------------
@@ -296,457 +132,56 @@ def quote(value):
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def caddyfile(cfg, sites, static, tcp, include_sites=True):
-    public, lan = cfg["public"], cfg["lan"]
-    index = ACTIVE / "pages"
-    # (forward PORT UPSTREAM) for tcp/ files: raw TCP on every bind address.
-    # Snippets used inside global options must be defined before that block.
-    listen = [f"[{a}]" if ":" in a and not a.startswith("[") else a for a in cfg["bind"]] or [""]
-    out = ["# import forward PORT UPSTREAM (in tcp/*.caddy)", "(forward) {",
-           "\t" + " ".join(f"{a}:{{args[0]}}" for a in listen) + " {",
-           "\t\troute {", "\t\t\tproxy {args[1]}", "\t\t}", "\t}", "}", ""]
-    out += ["{", f"\tadmin {ADMIN}", "\tskip_install_trust", "\tgrace_period 10s",
-           f"\thttp_port {cfg['http_port']}", f"\thttps_port {cfg['https_port']}"]
+def caddyfile(cfg, static):
+    out = ["{", f"\tadmin {ADMIN}", "\tauto_https off", "\tgrace_period 10s"]
     if cfg["bind"]:
         out.append("\tdefault_bind " + " ".join(cfg["bind"]))
-    if public:
-        out.append("\tacme_dns cloudflare {env.CLOUDFLARE_API_TOKEN}")
-    if cfg["relay_port"] and cfg["relay_trust"]:
-        # Keep the relay's proxy's X-Forwarded-* (its https) instead of replacing them.
+    if cfg["relay_trust"]:
+        # Keep the proxy's X-Forwarded-* (its https) instead of replacing them.
         out += ["\tservers {", "\t\ttrusted_proxies static " + " ".join(cfg["relay_trust"]), "\t}"]
-    serving = bool(public or lan)  # without a domain, only the www/ server runs
-    if include_sites and tcp and serving:
-        out.append("\tlayer4 {")
-        out += [f"\t\timport {quote(item['path'])}" for item in tcp]
-        out.append("\t}")
     out += ["\tlog default {", "\t\toutput stderr", "\t\tformat console", "\t}",
             "\tlog file {", f"\t\toutput file {quote(LOG)} {{", "\t\t\troll_size 5MiB", "\t\t\troll_keep 3",
-            "\t\t}", "\t\tformat json", "\t}", "}", ""]
-
-    # (site NAME { directives }) gives NAME every configured address.
-    plain = [f"{{args[0]}}.{public}"] if public else []
-    plain += [f"http://{{args[0]}}.{lan}"] if lan else []
-    out.append("(site) {")
-    if plain:
-        out += ["\t" + ", ".join(plain) + " {", "\t\t{block}", "\t}"]
-    if lan:
-        out += [f"\thttps://{{args[0]}}.{lan} {{", "\t\ttls internal", "\t\t{block}", "\t}"]
-    out += ["}", "",
-            "# import proxy NAME UPSTREAM", "(proxy) {", "\timport site {args[0]} {",
-            "\t\treverse_proxy {args[1]}", "\t}", "}", "",
+            "\t\t}", "\t\tformat json", "\t}", "}", "",
             "# Static folders: dotfiles are never served.", "(static_files) {",
             "\t@dotfiles path */.*", "\trespond @dotfiles 404", "\troot * {args[0]}",
             "\tfile_server {", "\t\thide .*", "\t}", "}", ""]
-
-    # Reserved sites, the unknown-name page and public HTTP->HTTPS redirects.
-    out += ["import site paseo {", f"\treverse_proxy 127.0.0.1:{cfg['paseo_port']}", "}", "",
-            "import site sites {", "\thandle /status.json {", "\t\theader Cache-Control no-store",
-            f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}",
-            "\thandle /dns.json {", "\t\theader Cache-Control no-store",
-            f"\t\troot * {quote(STATE)}", "\t\tfile_server", "\t}", "\thandle /root.crt {",
-            f"\t\troot * {quote(CA_ROOT.parent)}", "\t\trewrite * /root.crt", "\t\tfile_server", "\t}",
-            "\thandle {", f"\t\troot * {quote(index)}", "\t\tfile_server", "\t}", "}", ""]
-    unknown = ["\troot * " + quote(index), "\trewrite * /404.html", "\tfile_server {", "\t\tstatus 404", "\t}"]
-    if public:
-        out += [f"*.{public} {{"] + unknown + ["}", "",
-                f"http://*.{public} {{", "\tredir https://{host}{uri} permanent", "}", ""]
-    if lan:
-        out += [f"http://*.{lan} {{"] + unknown + ["}", "",
-                f"https://*.{lan} {{", "\ttls internal"] + unknown + ["}", ""]
-    # One wildcard per host of <service>.<host> sites: a single certificate covers
-    # every service on that host (Caddy 2.10+ prefers an applicable wildcard).
-    for host in (hosts(sites) if include_sites else []):
-        if public:
-            out += [f"*.{host}.{public} {{"] + unknown + ["}", "",
-                    f"http://*.{host}.{public} {{", "\tredir https://{host}{uri} permanent", "}", ""]
-        if lan:
-            out += [f"http://*.{host}.{lan} {{"] + unknown + ["}", "",
-                    f"https://*.{host}.{lan} {{", "\ttls internal"] + unknown + ["}", ""]
-
-    for item in static:
-        out += [f"# {item['source']}", f"import site {item['name']} {{",
-                f"\timport static_files {quote(item['root'])}", "}", ""]
-    if include_sites and serving:
-        for item in sites:
-            out += [f"# {item['source']}", f"import {quote(item['path'])}", ""]
-    if cfg["relay_port"]:
-        # The relay for a proxy elsewhere: only PROXY_RELAY_TRUST may use it. A numeric
-        # X-Hq-Relay-Port picks a loopback port; X-Hq-Relay-Root a folder under /workspace
-        # (no ".." or hidden parts); otherwise www/<name>/ by the Host's first label.
-        # A pass-through hop: flush every write so streams aren't held back.
-        out += ["# Relay for a proxy running elsewhere (hq-caddy `import relay`)",
-                f"http://:{cfg['relay_port']} {{", "\troute {"]
-        if cfg["relay_trust"]:
-            out += ["\t\t@outsider not remote_ip " + " ".join(cfg["relay_trust"]), '\t\trespond @outsider "Forbidden" 403']
-        else:
-            out += ['\t\trespond "Forbidden: PROXY_RELAY_TRUST is not set" 403']
-        out += ["\t\t@port header_regexp X-Hq-Relay-Port ^[0-9]{1,5}$",
-                "\t\treverse_proxy @port 127.0.0.1:{header.X-Hq-Relay-Port} {", "\t\t\theader_up -X-Hq-Relay-Port",
-                "\t\t\tflush_interval -1", "\t\t}",
-                "\t\t@root header_regexp X-Hq-Relay-Root ^/workspace(/[A-Za-z0-9_@+=-][A-Za-z0-9._@+=-]*)+/?$",
-                "\t\thandle @root {", "\t\t\timport static_files {header.X-Hq-Relay-Root}", "\t\t}"]
-        for index, item in enumerate(static):
-            out += [f"\t\t@www{index} expression {{host}}.startsWith({quote(item['name'] + '.')})",
-                    f"\t\thandle @www{index} {{", f"\t\t\timport static_files {quote(item['root'])}", "\t\t}"]
-        out += ['\t\trespond "Unknown static site" 404', "\t}", "}", ""]
+    # Only PROXY_RELAY_TRUST may use it. A numeric X-Hq-Relay-Port picks a loopback port;
+    # X-Hq-Relay-Root a folder under /workspace (no ".." or hidden parts); otherwise
+    # www/<name>/ by the Host's first label. A pass-through hop: flush every write so
+    # streams aren't held back.
+    out += ["# Relay for the proxy running elsewhere (hq-caddy `relay`, `relay_root`, `relay_files`)",
+            f"http://:{cfg['relay_port']} {{", "\troute {"]
+    if cfg["relay_trust"]:
+        out += ["\t\t@outsider not remote_ip " + " ".join(cfg["relay_trust"]), '\t\trespond @outsider "Forbidden" 403']
+    else:
+        out += ['\t\trespond "Forbidden: PROXY_RELAY_TRUST is not set" 403']
+    out += ["\t\t@port header_regexp X-Hq-Relay-Port ^[0-9]{1,5}$",
+            "\t\treverse_proxy @port 127.0.0.1:{header.X-Hq-Relay-Port} {", "\t\t\theader_up -X-Hq-Relay-Port",
+            "\t\t\tflush_interval -1", "\t\t}",
+            "\t\t@root header_regexp X-Hq-Relay-Root ^/workspace(/[A-Za-z0-9_@+=-][A-Za-z0-9._@+=-]*)+/?$",
+            "\t\thandle @root {", "\t\t\timport static_files {header.X-Hq-Relay-Root}", "\t\t}"]
+    for index, item in enumerate(static):
+        out += [f"\t\t@www{index} expression {{host}}.startsWith({quote(item['name'] + '.')})",
+                f"\t\thandle @www{index} {{", f"\t\t\timport static_files {quote(item['root'])}", "\t\t}"]
+    out += ['\t\trespond "Unknown static site" 404', "\t}", "}", ""]
     return "\n".join(out) + "\n"
 
 
-def urls(cfg, name):
-    found = [f"https://{name}.{cfg['public']}"] if cfg["public"] else []
-    if cfg["lan"]:
-        found += [f"http://{name}.{cfg['lan']}", f"https://{name}.{cfg['lan']}"]
-    return found
-
-
-# ----- sites page --------------------------------------------------------------
-
-PAGE_STYLE = """
-:root{--bg:#0a0a0b;--panel:#111113;--hover:#16161a;--border:#222227;--text:#e7e7ea;--muted:#8b8b94;
---faint:#80808a;--link:#4ade80;--up:#22c55e;--down:#ef4444;--warn:#eab308;--ring:#71717a}
-*{box-sizing:border-box}
-html{background:var(--bg);color-scheme:dark}
-body{margin:0;font:.875rem/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--text)}
-.wrap{max-width:1040px;margin:0 auto;padding:40px 24px 64px}
-header{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px 24px;margin-bottom:20px}
-h1{font-size:1.375rem;font-weight:600;margin:0;letter-spacing:-.01em}
-h2{font-size:.8125rem;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:32px 0 10px}
-.sub{color:var(--muted);margin:2px 0 0}
-.sub b{color:#f87171;font-weight:500}
-.tools{display:flex;flex-wrap:wrap;gap:8px;margin-left:auto;align-items:center}
-.nojs .tools{display:none}
-.chip{font:inherit;font-size:.75rem;color:var(--muted);background:transparent;border:1px solid var(--border);
-border-radius:999px;padding:3px 10px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
-.chip:hover{color:var(--text);border-color:#3a3a42}
-.chip[aria-pressed=true]{color:var(--text);background:var(--hover);border-color:var(--link)}
-.chip b{font-weight:600;color:var(--text)}
-input{font:inherit;font-size:.8125rem;color:var(--text);background:var(--panel);border:1px solid #3a3a42;
-border-radius:8px;padding:5px 10px;width:180px}
-:focus-visible{outline:2px solid var(--link);outline-offset:2px}
-#shown{font-size:.75rem;color:var(--muted)}
-.list{list-style:none;margin:0;padding:0;border:1px solid var(--border);border-radius:12px;background:var(--panel);overflow:hidden}
-.row{position:relative;display:grid;grid-template-columns:18px minmax(0,1fr) auto;gap:4px 14px;align-items:start;
-padding:11px 16px;border-top:1px solid var(--border);margin-top:-1px}
-.row:hover{background:var(--hover)}
-[hidden]{display:none!important}
-.name{font-weight:500;color:var(--text);text-decoration:none}
-a.name::after{content:"";position:absolute;inset:0}
-a.name:focus-visible{outline:none}
-.row:has(a.name:focus-visible){outline:2px solid var(--link);outline-offset:-2px}
-.row:has(a.name):hover .name{color:var(--link)}
-.kind{font-size:.6875rem;color:var(--faint);margin-left:8px}
-.tag{font-size:.6875rem;color:var(--muted);border:1px solid var(--border);border-radius:4px;padding:0 5px;margin-left:8px}
-.links{display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:2px;font-size:.75rem;color:var(--muted)}
-.links a{position:relative;z-index:1;color:var(--muted);text-decoration:none}
-.links a:hover{color:var(--link);text-decoration:underline}
-.note{font-size:.75rem;color:var(--muted);text-align:right;max-width:24rem;overflow-wrap:anywhere;padding-top:2px}
-.row[data-state=down] .note{color:#f87171}
-.row[data-state=unsure] .note,.row[data-state=checking] .note{color:#facc15}
-.dot{width:10px;height:10px;margin-top:6px;border-radius:50%;justify-self:center;border:1.5px solid var(--ring)}
-.dot.up{background:var(--up);border:0;box-shadow:0 0 0 3px rgba(34,197,94,.15)}
-.dot.down{background:var(--down);border:0;border-radius:2px;box-shadow:0 0 0 3px rgba(239,68,68,.18)}
-.dot.unsure,.dot.checking{width:12px;height:11px;margin-top:5px;background:var(--warn);border:0;border-radius:0;
-clip-path:polygon(50% 0,100% 100%,0 100%)}
-.dot.checking{animation:pulse 1.4s ease-in-out infinite}
-@keyframes pulse{50%{opacity:.35}}
-@media (prefers-reduced-motion:reduce){.dot.checking{animation:none}}
-.plain .row{grid-template-columns:minmax(0,1fr)}
-.banner{border:1px solid rgba(239,68,68,.35);background:rgba(239,68,68,.08);color:#fca5a5;border-radius:10px;padding:10px 14px}
-.empty{color:var(--muted);border:1px dashed var(--border);border-radius:12px;padding:16px;display:flex;gap:12px;align-items:center}
-.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
-ul.skipped{color:var(--muted);padding-left:20px}
-code{font:.75rem ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--hover);border:1px solid var(--border);
-border-radius:5px;padding:1px 5px}
-footer{margin-top:28px;color:var(--faint);font-size:.75rem;display:flex;flex-wrap:wrap;gap:6px 18px}
-footer a{color:var(--muted)}
-.lost{min-height:70vh;display:flex;flex-direction:column;justify-content:center;max-width:36rem;margin:0 auto}
-.lost .code{font:600 .8125rem ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--faint);letter-spacing:.12em;margin:0 0 6px}
-.lost .host{color:var(--text);font-weight:500;overflow-wrap:anywhere}
-.button{display:inline-block;margin-top:20px;padding:8px 14px;border:1px solid var(--border);border-radius:8px;background:var(--panel);color:var(--link);text-decoration:none;font-weight:500}
-.button:hover{border-color:var(--link)}
-@media (max-width:640px){.row{grid-template-columns:18px minmax(0,1fr)}.note{grid-column:2;text-align:left;max-width:none}
-.tools{margin-left:0}input{width:100%}}
-"""
-
-FAVICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E"
-           "%3Ccircle cx='8' cy='8' r='6' fill='{color}'/%3E%3C/svg%3E")
-STATE_ORDER = {"down": 0, "unsure": 1, "checking": 1, "up": 2, "none": 3}
-STATE_LABELS = {"up": "Up", "down": "Down", "unsure": "Unsure", "checking": "Checking", "none": "No health check"}
-
-# The sites page refreshes the dots from /status.json and the DNS list from /dns.json.
-STATUS_SCRIPT = """<script>
-document.documentElement.classList.remove("nojs");
-const labels = {up: "Up", down: "Down", unsure: "Unsure", checking: "Checking", none: "No health check"};
-const order = {down: 0, unsure: 1, checking: 1, up: 2, none: 3};
-const favicon = "__FAVICON__";
-const $ = (id) => document.getElementById(id);
-let filter = "all", last = null;
-function ago(s) { s = Math.max(0, s); return s < 90 ? Math.round(s) + "s ago" : s < 5400 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago"; }
-function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; }
-function serverNow(res) { return (Date.parse(res.headers.get("Date")) / 1000) || Date.now() / 1000; }
-function setNote(row, state, detail) {
-  const note = row.querySelector(".note");
-  const label = (state === "up" || state === "none") ? el("span", "sr", labels[state] + ": ") : document.createTextNode(labels[state] + " \\u00b7 ");
-  note.replaceChildren(label, document.createTextNode(detail));
-}
-function readHash() {
-  const p = new URLSearchParams(location.hash.slice(1));
-  filter = p.get("filter") || "all";
-  $("q").value = p.get("q") || "";
-}
-function writeHash() {
-  const p = new URLSearchParams(), q = $("q").value.trim();
-  if (filter !== "all") p.set("filter", filter);
-  if (q) p.set("q", q);
-  const hash = p.toString();
-  history.replaceState(null, "", hash ? "#" + hash : location.pathname + location.search);
-}
-function apply() {
-  const q = $("q").value.trim().toLowerCase();
-  let shown = 0, total = 0;
-  for (const row of document.querySelectorAll("[data-search]")) {
-    const state = row.dataset.state === "checking" ? "unsure" : row.dataset.state;
-    const statusOk = filter === "all" || (row.dataset.key && state === filter);
-    row.hidden = !statusOk || (q && !row.dataset.search.includes(q));
-    total++; if (!row.hidden) shown++;
-  }
-  for (const section of document.querySelectorAll("section[data-group]"))
-    section.hidden = !section.querySelector("[data-search]:not([hidden])");
-  for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.setAttribute("aria-pressed", chip.dataset.filter === filter);
-  const filtering = filter !== "all" || q;
-  $("shown").textContent = filtering ? shown + " of " + total + " shown" : "";
-  $("empty").hidden = !filtering || !!document.querySelector("section[data-group]:not([hidden])");
-  writeHash();
-}
-async function refresh() {
-  if (document.hidden) return;
-  let data, now;
-  try {
-    const res = await fetch("/status.json", {cache: "no-store"});
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    data = await res.json(); now = serverNow(res);
-    last = {data, now, at: Date.now()};
-    $("status-error").hidden = true;
-  } catch (e) {
-    $("status-error").hidden = false;
-    $("status-error").textContent = "Status unavailable (" + e.message + "). " +
-      (last ? "Showing the results from " + ago((Date.now() - last.at) / 1000) + "." : "Showing the states from the last reload.");
-    if (!last) return;
-    data = last.data; now = last.now + (Date.now() - last.at) / 1000;
-  }
-  const counts = {all: 0, up: 0, down: 0, unsure: 0, none: 0};
-  for (const row of document.querySelectorAll(".row[data-key]")) {
-    const r = data.checks[row.dataset.key];
-    let state = "none", detail = "add a \\u2018# check:\\u2019 line to the site file";
-    if (row.dataset.check) {
-      if (!r) { state = "checking"; detail = "not checked yet"; }
-      else if (now - r.checked > 3 * data.interval) { state = "checking"; detail = "stale: " + r.note; }
-      else { state = r.state; detail = r.note; }
-      if (r) detail += " \\u00b7 " + ago(now - r.checked);
-    }
-    row.dataset.state = state;
-    const dot = row.querySelector(".dot");
-    dot.className = "dot " + state;
-    dot.setAttribute("aria-label", labels[state]);
-    dot.title = labels[state];
-    setNote(row, state, state === "none" ? "" : detail);
-    if (state === "none") row.querySelector(".note").title = detail;
-    counts.all++;
-    counts[state === "checking" ? "unsure" : state]++;
-  }
-  for (const list of document.querySelectorAll(".list[data-sorted]"))
-    list.append(...[...list.children].sort((a, b) => (order[a.dataset.state] ?? 3) - (order[b.dataset.state] ?? 3) || a.dataset.i - b.dataset.i));
-  for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.querySelector("b").textContent = counts[chip.dataset.filter];
-  const down = counts.down;
-  $("downs").textContent = down ? " \\u00b7 " : "";
-  $("downs-n").textContent = down ? down + " down" : "";
-  document.title = down ? "Sites (" + down + " down)" : "Sites";
-  $("favicon").href = favicon.replace("{color}", down ? "%23ef4444" : counts.unsure ? "%23eab308" : "%2322c55e");
-  if (data.updated) {
-    $("updated").textContent = "Checked " + ago(now - data.updated);
-    $("updated").title = new Date(data.updated * 1000).toLocaleString();
-  }
-  apply();
-}
-async function loadDns() {
-  if (document.hidden) return;
-  let data, now;
-  try { const res = await fetch("/dns.json", {cache: "no-store"}); if (!res.ok) return; data = await res.json(); now = serverNow(res); } catch (e) { return; }
-  $("dns-list").replaceChildren(...data.records.map((r) => {
-    const row = el("li", "row"), main = el("div"), links = el("div", "links");
-    row.dataset.search = [r.name, r.address, r.comment, r.address === data.proxy ? "proxy" : ""].join(" ").toLowerCase();
-    main.append(el("span", "name", r.name));
-    if (r.address === data.proxy) main.append(el("span", "tag", "\\u2192 proxy"));
-    links.append(el("span", "", r.address));
-    if (r.comment) links.append(el("span", "", r.comment));
-    main.append(links); row.append(main);
-    return row;
-  }));
-  $("dns-note").textContent = data.records.length + " records point to local addresses" +
-    (data.error ? " \\u00b7 last refresh failed: " + data.error : "") + " \\u00b7 refreshed " + ago(now - data.updated);
-  apply();
-}
-for (const chip of document.querySelectorAll(".chip[data-filter]")) chip.onclick = () => { filter = chip.dataset.filter; apply(); };
-$("clear").onclick = () => { filter = "all"; $("q").value = ""; apply(); $("q").focus(); };
-$("q").oninput = apply;
-$("q").onkeydown = (e) => {
-  if (e.key === "Escape") { $("q").value = ""; apply(); }
-  if (e.key === "Enter") {
-    const links = [...document.querySelectorAll(".row:not([hidden]) a.name")];
-    if (links.length === 1) location.href = links[0].href;
-  }
-};
-document.addEventListener("keydown", (e) => {
-  if (e.key === "/" && document.activeElement !== $("q") && !e.ctrlKey && !e.metaKey) { e.preventDefault(); $("q").focus(); }
-});
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { refresh(); loadDns(); } });
-window.addEventListener("hashchange", () => { readHash(); apply(); });
-readHash();
-apply();
-refresh();
-loadDns();
-setInterval(() => { refresh(); loadDns(); }, 30000);
-</script>"""
-
-NOT_FOUND_SCRIPT = """<script>
-document.getElementById("host").textContent = location.hostname;
-</script>"""
-
-
-def not_found_page(cfg):
-    """The page for names nothing is published at: say so and link to the index."""
-    index = f"https://sites.{cfg['public']}" if cfg["public"] else f"http://sites.{cfg['lan']}"
-    return ("<!doctype html><html lang=en><meta charset=utf-8>"
-            "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
-            f"<title>Unknown site</title><link rel=icon href=\"{FAVICON.replace('{color}', '%2371717a')}\">"
-            f"<style>{PAGE_STYLE}</style><div class=wrap><main class=lost>"
-            "<p class=code>404</p><h1>Unknown site</h1>"
-            "<p class=sub><span class=host id=host>This name</span> isn't published here.</p>"
-            f"<p><a class=button href=\"{html.escape(index)}\">See all sites \u2192</a></p>"
-            f"</main></div>{NOT_FOUND_SCRIPT}")
-
-
-def link_label(cfg, url):
-    """Short label for a LAN address, e.g. https · home.lan."""
-    scheme, _, host = url.partition("://")
-    return f"{scheme} · {cfg['lan']}" if cfg["lan"] and host.endswith("." + cfg["lan"]) else host
-
-
-def natural(name):
-    """personas, personas-dev, personas-preview; dockge, dockge.pi."""
-    return [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in re.split(r"[-.]|(\d+)", name) if part]
-
-
-def pages(cfg, sites, static, skipped, tcp, degraded):
-    status, now = load_status(), time.time()
-
-    def state_of(key, item):
-        state, note = check_state(item, status.get("checks", {}).get(key), cfg["check_interval"], now)
-        return state, ("" if state == "none" else note)
-
-    def row(index, key, name, kind, check, links_html, href, search):
-        title = (f'<a class=name href="{html.escape(href)}">{html.escape(name)}</a>' if href
-                 else f"<span class=name>{html.escape(name)}</span>")
-        tag = f"<span class=kind>{kind}</span>" if kind != "site" else ""
-        state, note = state_of(key, {"check": check})
-        label = STATE_LABELS[state]
-        shown = (f"<span class=sr>{label}: </span>" if state in ("up", "none") else f"{label} · ") + html.escape(note)
-        return (f'<li class=row data-key="{html.escape(key)}" data-i={index} data-state={state} '
-                f'data-search="{html.escape(search.lower())}"{" data-check=1" if check else ""}>'
-                f'<span class="dot {state}" role=img aria-label="{label}" title="{label}"></span>'
-                f"<div>{title}{tag}{links_html}</div><div class=note>{shown}</div></li>")
-
-    def site_links(name):
-        found = urls(cfg, name)
-        if not found:
-            return "", "", ""
-        rest = "".join(f'<a href="{html.escape(u)}" tabindex=-1>{html.escape(link_label(cfg, u))}</a>' for u in found[1:])
-        return (f"<div class=links><span>{html.escape(found[0].split('://', 1)[1])}</span>{rest}</div>",
-                found[0], " ".join(found))
-
-    def listing(title):
-        entries = sorted([("site", item) for item in ([] if degraded else sites)] + [("static", item) for item in static],
-                         key=lambda pair: natural(pair[1]["name"]))
-        rows, counts = [], {}
-        for index, (kind, item) in enumerate(entries):
-            links_html, href, search = site_links(item["name"])
-            key = f"{kind}:{item['name']}"
-            state = state_of(key, item)[0]
-            rows.append((STATE_ORDER[state], index, row(index, key, item["name"], kind, item.get("check"),
-                                                        links_html, href, f"{item['name']} {kind} {search}")))
-            counts[state] = counts.get(state, 0) + 1
-        rows = [html_row for _, _, html_row in sorted(rows)]  # down, then unsure, then the rest
-        forwards = []
-        for index, t in enumerate([] if degraded else tcp):
-            ports = ", ".join(t["ports"]) or "custom rule"
-            forwards.append(row(index, f"tcp:{t['name']}", t["name"], "tcp", t.get("check"),
-                                f"<div class=links><span>{html.escape(ports)}</span></div>", "",
-                                f"{t['name']} tcp {ports}"))
-            state = state_of(f"tcp:{t['name']}", t)[0]
-            counts[state] = counts.get(state, 0) + 1
-        domain = cfg["public"] or cfg["lan"]
-        down = counts.get("down", 0)
-        parts = f"{len(entries)} site{'s' if len(entries) != 1 else ''} on <code>{html.escape(domain)}</code>"
-        if forwards:
-            parts += f" · {len(forwards)} TCP forward{'s' if len(forwards) != 1 else ''}"
-        sub = (f"{parts}<span id=downs>{' · ' if down else ''}</span>"
-               f"<b id=downs-n>{f'{down} down' if down else ''}</b>")
-        chips = [("all", "All", sum(counts.values())), ("up", "Up", counts.get("up", 0)),
-                 ("down", "Down", down), ("unsure", "Unsure", counts.get("unsure", 0) + counts.get("checking", 0)),
-                 ("none", "No check", counts.get("none", 0))]
-        tools = ("<div class=tools>" + "".join(
-            f'<button type=button class=chip data-filter={key} aria-pressed={"true" if key == "all" else "false"}>'
-            f"{label} <b>{count}</b></button>" for key, label, count in chips)
-            + "<input id=q type=search placeholder='Filter (press /)' aria-label='Filter by name or address'>"
-            "<span id=shown aria-live=polite></span></div>")
-        banner = ("<p class=banner>Site files are disabled: the configuration has an error. "
-                  "Run <code>workstation-proxy check</code>.</p>") if degraded else ""
-        body = "<p id=status-error class=banner role=status hidden></p>" + banner
-        body += (f"<section data-group><h2 class=sr>Sites</h2><ul class=list data-sorted>{''.join(rows)}</ul></section>"
-                 if rows else "<p class=sub>No sites yet.</p>")
-        if forwards:
-            body += f"<section data-group><h2>TCP forwards</h2><ul class=list data-sorted>{''.join(forwards)}</ul></section>"
-        body += ("<section data-group hidden><h2>DNS records</h2><p class=sub id=dns-note></p>"
-                 "<ul class='list plain' id=dns-list></ul></section>"
-                 "<p id=empty class=empty hidden>No matches. <button type=button class=chip id=clear>Clear filters</button></p>")
-        if skipped:
-            body += "<h2>Skipped</h2><ul class=skipped>" + "".join(
-                f"<li><code>{html.escape(s['source'])}</code> {html.escape(s['reason'])}</li>" for s in skipped) + "</ul>"
-        footer = ["<span id=updated>Not checked yet</span>"]
-        if cfg["lan"]:
-            footer.append(f"<span>Internal CA for <code>*.{html.escape(cfg['lan'])}</code>: "
-                          "<a href='/root.crt'>root.crt</a> (install it on a device to trust those names)</span>")
-        color = "%23ef4444" if down else "%2322c55e"
-        return ("<!doctype html><html lang=en class=nojs><meta charset=utf-8>"
-                "<meta name=viewport content='width=device-width,initial-scale=1'><meta name=color-scheme content=dark>"
-                f"<title>{html.escape(title)}{f' ({down} down)' if down else ''}</title>"
-                f"<link id=favicon rel=icon href=\"{FAVICON.replace('{color}', color)}\">"
-                f"<style>{PAGE_STYLE}</style><div class=wrap>"
-                f"<header><div><h1>{html.escape(title)}</h1><p class=sub id=summary>{sub}</p></div>{tools}</header>"
-                f"<main>{body}</main><footer>{''.join(footer)}</footer></div>"
-                f"{STATUS_SCRIPT.replace('__FAVICON__', FAVICON)}")
-    # Unknown names serve 404.html for every path.
-    return {"index.html": listing("Sites"), "404.html": not_found_page(cfg)}
-
-
-def build(target, cfg, include_sites=True):
-    """Write a complete configuration directory; return the report dict."""
-    sites, static, skipped, tcp = collect(cfg)
+def build(target, cfg):
+    """Write a configuration directory; return the report dict."""
+    static, skipped = collect(cfg)
     if target.exists():
         shutil.rmtree(target)
-    (target / "pages").mkdir(parents=True)
-    text = caddyfile(cfg, sites, static, tcp, include_sites).replace(str(ACTIVE), str(target))
-    (target / "Caddyfile").write_text(text)
+    target.mkdir(parents=True)
+    (target / "Caddyfile").write_text(caddyfile(cfg, static))
     # Normalise formatting so Caddy does not warn about it on every start.
     subprocess.run(["caddy", "fmt", "--overwrite", str(target / "Caddyfile")], capture_output=True)
-    for name, content in pages(cfg, sites, static, skipped, tcp, not include_sites).items():
-        (target / "pages" / name).write_text(content)
-    return {"public": cfg["public"], "lan": cfg["lan"], "bind": cfg["bind"], "degraded": not include_sites,
-            "problems": cfg["problems"], "sites": sites, "static": static, "skipped": skipped, "tcp": tcp}
+    return {"relay_port": cfg["relay_port"], "relay_trust": cfg["relay_trust"], "bind": cfg["bind"],
+            "problems": cfg["problems"], "static": static, "skipped": skipped}
 
 
 def caddy(*args):
-    return subprocess.run(["caddy", *args], env=caddy_env(), capture_output=True, text=True)
+    return subprocess.run(["caddy", *args], capture_output=True, text=True)
 
 
 def validate(directory):
@@ -762,46 +197,21 @@ def promote(report):
     if ACTIVE.exists():
         ACTIVE.rename(old)
     CANDIDATE.rename(ACTIVE)
-    # Rewrite candidate paths to the active location.
-    caddy_file = ACTIVE / "Caddyfile"
-    caddy_file.write_text(caddy_file.read_text().replace(str(CANDIDATE), str(ACTIVE)))
     REPORT.write_text(json.dumps(report, indent=2) + "\n")
     if old.exists():
         shutil.rmtree(old)
 
 
-def prepare(cfg, strict):
-    """Build and validate a candidate; promote it. With strict=False, fall back to
-    a configuration without project site files when they make it invalid."""
+def prepare(cfg):
+    """Build and validate a candidate, then promote it. Returns (ok, error message)."""
     STATE.mkdir(parents=True, exist_ok=True)
-    for sub in ("sites", "www", "tcp"):
-        (cfg["config"] / sub).mkdir(parents=True, exist_ok=True)
-    readme = cfg["config"] / "README.md"
-    if not readme.exists() and TEMPLATE_README.exists():
-        shutil.copy(TEMPLATE_README, readme)
     report = build(CANDIDATE, cfg)
-    dns = ensure_dns(cfg, hosts(report["sites"]))
-    for item in dns:
-        if item["state"].startswith("error"):
-            print(f"workstation-proxy: WARNING: DNS {item['name']}: {item['state']}", file=sys.stderr, flush=True)
-        elif item["state"] == "created":
-            print(f"workstation-proxy: created DNS record {item['name']} -> {cfg['dns_target']}", flush=True)
     ok, message = validate(CANDIDATE)
-    if not ok and not strict:
-        report = build(CANDIDATE, cfg, include_sites=False)
-        degraded_ok, degraded_message = validate(CANDIDATE)
-        if degraded_ok:
-            ERROR.write_text(message + "\n")
-            report["dns"] = dns
-            promote(report)
-            return True, "site files disabled because the configuration is invalid:\n" + message
-        message = degraded_message
     if not ok:
         ERROR.write_text(message + "\n")
         shutil.rmtree(CANDIDATE, ignore_errors=True)
         return False, message
     ERROR.unlink(missing_ok=True)
-    report["dns"] = dns
     promote(report)
     return True, ""
 
@@ -814,185 +224,18 @@ def running():
         return False
 
 
-# ----- status checks ---------------------------------------------------------
-
-def check_targets(report):
-    """Published entries as (key, item); key is kind:name, as used by the sites page."""
-    found = [("static:" + item["name"], dict(item, kind="static")) for item in report["static"]]
-    if not report["degraded"]:
-        found += [("site:" + item["name"], dict(item, kind="site")) for item in report["sites"]]
-        found += [("tcp:" + item["name"], dict(item, kind="tcp")) for item in report.get("tcp", [])]
-    return found
-
-
-def upstream(path):
-    """host:port of the first `import proxy NAME UPSTREAM` or `import forward PORT UPSTREAM`."""
+def load_report():
     try:
-        found = re.search(r"^\s*import\s+(?:proxy\s+\S+|forward\s+\d+)\s+(\S+)", Path(path).read_text(), re.M)
-    except OSError:
-        return ""
-    return re.sub(r"^\w+://", "", found.group(1)).split("/")[0] if found else ""
-
-
-def codes_match(code, spec):
-    for part in re.split(r"[,\s]+", spec or "200-399"):
-        low, _, high = part.partition("-")
-        if part == code or (re.fullmatch(r"\dxx", part) and part[0] == code[0]) or (
-                high and low.isdigit() and high.isdigit() and int(low) <= int(code) <= int(high)):
-            return True
-    return False
-
-
-def check_http(cfg, item, target, codes):
-    extra = []
-    if target.startswith("/"):
-        if item["kind"] != "site":
-            return "unsure", "a path check needs a site file"
-        # Through the proxy's own address: DNS name, certificate, proxy and app together.
-        scheme, port = ("https", cfg["https_port"]) if cfg["public"] else ("http", cfg["http_port"])
-        host = f"{item['name']}.{cfg['public'] or cfg['lan']}"
-        address = next((a for a in cfg["bind"]), "127.0.0.1")
-        address = f"[{address}]" if ":" in address and not address.startswith("[") else address
-        extra = ["--resolve", f"{host}:{port}:{address}"]
-        target = f"{scheme}://{host}" + ("" if port in ("80", "443") else f":{port}") + target
-    result = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time",
-                             str(CHECK_TIMEOUT), *extra, target], capture_output=True, text=True)
-    code = result.stdout.strip()
-    if result.returncode or not code.isdigit() or code == "000":
-        message = (result.stderr.strip().splitlines() or ["no answer"])[-1].removeprefix("curl: ")
-        # 35/60: TLS or certificate problems; the site may be fine, the check can't tell.
-        return ("unsure" if result.returncode in (35, 60) else "down"), message[:160]
-    if codes_match(code, codes):
-        return "up", f"HTTP {code}"
-    return ("down" if code.startswith("5") else "unsure"), f"HTTP {code} (expected {codes or '200-399'})"
-
-
-def check_tcp(address):
-    host, _, port = address.rpartition(":")
-    if not host or not port.isdigit():
-        return "unsure", f"no host:port to check ({address or 'none found'})"
-    try:
-        with socket.create_connection((host.strip("[]"), int(port)), timeout=CHECK_TIMEOUT):
-            return "up", f"{address} accepts connections"
-    except OSError as error:
-        return "down", f"{address}: {error.strerror or type(error).__name__}"
-
-
-def check_command(cfg, item, command):
-    environment = {k: v for k, v in os.environ.items() if not k.startswith("CLOUDFLARE_API_TOKEN")}
-    environment.update(CHECK_NAME=item["name"], CHECK_URL=(urls(cfg, item["name"]) or [""])[0])
-    try:
-        result = subprocess.run(["bash", "-c", command], cwd=cfg["config"], env=environment,
-                                capture_output=True, text=True, timeout=CHECK_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return "down", f"timed out after {CHECK_TIMEOUT}s"
-    note = ((result.stdout.strip() or result.stderr.strip()).splitlines() or [f"exit {result.returncode}"])[0]
-    return {0: "up", 1: "down"}.get(result.returncode, "unsure"), note[:160]
-
-
-def run_check(cfg, item):
-    """Return (state, note); state is up, down or unsure."""
-    spec = item["check"]
-    word, _, rest = spec.partition(" ")
-    try:
-        if item["kind"] == "static":
-            return ("up", "static folder") if Path(item["root"]).is_dir() else ("down", "folder is gone")
-        if word.startswith("/") or re.match(r"https?://", word):
-            return check_http(cfg, item, word, rest.strip())
-        if word == "tcp":
-            return check_tcp(rest.strip() or upstream(item["path"]))
-        if word == "run" and rest.strip():
-            return check_command(cfg, item, rest.strip())
-        return "unsure", f"unknown check: {spec[:80]}"
-    except Exception as error:  # one broken check must not stop the others
-        return "unsure", f"check failed: {type(error).__name__}: {error}"[:160]
-
-
-def load_json(path):
-    try:
-        return json.loads(path.read_text())
+        return json.loads(REPORT.read_text())
     except (OSError, ValueError):
-        return {}
-
-
-def load_status():
-    return load_json(STATUS)
-
-
-def write_json(path, data):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, indent=1) + "\n")
-    temporary.replace(path)
-
-
-def private(address):
-    try:
-        return ipaddress.ip_address(address).is_private
-    except ValueError:
-        return False
-
-
-def refresh_dns(cfg):
-    """List the zone's A/AAAA records under PROXY_DOMAIN that point to private addresses,
-    for the sites page. At most once per check interval; one API call per 500 records."""
-    if not (cfg["public"] and token()):
-        DNS_LIST.unlink(missing_ok=True)
-        return
-    previous = load_json(DNS_LIST)
-    if time.time() - previous.get("updated", 0) < cfg["check_interval"]:
-        return
-    data = {"updated": int(time.time()), "proxy": cfg["dns_target"], "records": previous.get("records", [])}
-    try:
-        zone, records, page = zone_id(cfg), [], 1
-        if not zone:
-            raise ValueError(f"no Cloudflare zone found for {cfg['public']}")
-        while True:
-            answer = cloudflare("GET", f"/zones/{zone}/dns_records?per_page=500&page={page}")
-            if not answer.get("success"):
-                raise ValueError("; ".join(e.get("message", "?") for e in answer.get("errors", [])) or "request failed")
-            records += [{"name": r["name"], "address": r["content"], "comment": r.get("comment") or ""}
-                        for r in answer["result"] if r["type"] in ("A", "AAAA") and private(r["content"])
-                        and (r["name"] == cfg["public"] or r["name"].endswith("." + cfg["public"]))]
-            if page >= (answer.get("result_info") or {}).get("total_pages", 1):
-                break
-            page += 1
-        # The domain's wildcard first, then each host followed by its *.<host> wildcard.
-        data["records"] = sorted(records, key=lambda r: (r["name"] != "*." + cfg["public"],
-                                                         r["name"].removeprefix("*."), r["name"].startswith("*.")))
-    except (OSError, ValueError, KeyError) as error:
-        data["error"] = f"{type(error).__name__}: {error}"[:160]  # keep the last good list
-    write_json(DNS_LIST, data)
-
-
-def run_due_checks(cfg, report):
-    """Check every entry whose result is older than the interval (or whose check changed)."""
-    previous, now = load_status().get("checks", {}), time.time()
-    targets = [(key, item) for key, item in check_targets(report) if item.get("check")]
-    due = [(key, item) for key, item in targets
-           if key not in previous or previous[key].get("check") != item["check"]
-           or now - previous[key].get("checked", 0) >= cfg["check_interval"]]
-    results = {key: previous[key] for key, _ in targets if key in previous}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for (key, item), (state, note) in zip(due, pool.map(lambda pair: run_check(cfg, pair[1]), due)):
-            results[key] = {"state": state, "note": note, "checked": int(time.time()), "check": item["check"]}
-    write_json(STATUS, {"interval": cfg["check_interval"], "updated": int(time.time()), "checks": results})
-
-
-def check_state(item, record, interval, now):
-    if not item.get("check"):
-        return "none", "no status check"
-    if not record:
-        return "checking", "not checked yet"
-    if now - record["checked"] > 3 * interval:
-        return "checking", "stale: " + record["note"]
-    return record["state"], record["note"]
+        return None
 
 
 # ----- commands --------------------------------------------------------------
 
 def require_enabled():
     if not enabled():
-        print("workstation-proxy: disabled (set PROXY_DOMAIN and/or PROXY_LAN_DOMAIN to enable)")
+        print("workstation-proxy: disabled (set PROXY_RELAY_PORT to run the relay)")
         sys.exit(0)
 
 
@@ -1001,33 +244,19 @@ def report_problems(cfg):
         print(f"warning: {problem}")
 
 
-def cmd_check(_):
-    cfg = settings()
-    report_problems(cfg)
-    if not (cfg["public"] or cfg["lan"]):
-        # The proxy runs elsewhere: still validate site files, against a placeholder domain.
-        cfg["lan"] = "example.lan"
-    STATE.mkdir(parents=True, exist_ok=True)
-    report = build(CANDIDATE, cfg)
-    ok, message = validate(CANDIDATE)
-    shutil.rmtree(CANDIDATE, ignore_errors=True)
-    for skip in report["skipped"]:
-        print(f"skipped {skip['source']}: {skip['reason']}")
-    print("configuration valid" if ok else "configuration INVALID:\n" + message)
-    return 0 if ok else 1
-
-
-def cmd_reload(_):
+def cmd_reload(args):
     require_enabled()
     cfg = settings()
+    if "--if-changed" in args:
+        report = load_report()
+        if report and running() and list(collect(cfg)) == [report["static"], report["skipped"]]:
+            return 0
     report_problems(cfg)
-    ok, message = prepare(cfg, strict=True)
+    ok, message = prepare(cfg)
     if not ok:
         print("configuration INVALID; the running configuration is unchanged:\n" + message)
         return 1
     if running():
-        print("applying (if new names need certificates, this can take a few minutes; sites keep serving)",
-              flush=True)
         result = caddy("reload", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile",
                        "--address", ADMIN)
         if result.returncode != 0:
@@ -1041,56 +270,31 @@ def cmd_reload(_):
     return 0
 
 
-def load_report():
-    try:
-        return json.loads(REPORT.read_text())
-    except (OSError, ValueError):
-        return None
-
-
 def cmd_sites(_):
     require_enabled()
-    cfg, report = settings(), load_report()
+    report = load_report()
     if not report:
         print("no configuration yet: run workstation-proxy reload")
         return 1
-    for name in ("paseo", "sites"):
-        print(f"{name:20} reserved  {' '.join(urls(cfg, name))}")
-    for kind in ("sites", "static"):
-        for item in report[kind]:
-            state = " (disabled: config error)" if report["degraded"] and kind == "sites" else ""
-            print(f"{item['name']:20} {kind[:-1] if kind == 'sites' else 'static':9} {' '.join(urls(cfg, item['name']))}{state}")
-    for item in report.get("tcp", []):
-        state = " (disabled: config error)" if report["degraded"] else ""
-        print(f"{item['name']:20} tcp       {', '.join(item['ports']) or item['source']}{state}")
+    for item in report["static"]:
+        print(f"{item['name']:20} served    {item['source']} -> {item['root']}")
     for skip in report["skipped"]:
         print(f"{skip['name']:20} skipped   {skip['source']}: {skip['reason']}")
+    print("Publish one on the proxy with a homelab-proxy site file: import relay_files <name>")
     return 0
 
 
 def cmd_status(_):
     if not enabled():
-        print("disabled (set PROXY_DOMAIN and/or PROXY_LAN_DOMAIN to enable)")
+        print("disabled (set PROXY_RELAY_PORT to run the relay)")
         return 0
     cfg, report = settings(), load_report()
     report_problems(cfg)
-    print(f"domains: public={cfg['public'] or '-'} lan={cfg['lan'] or '-'} bind={' '.join(cfg['bind']) or 'all'}")
-    if cfg["manage_dns"]:
-        dns = (report or {}).get("dns", [])
-        print("dns: managed (" + (", ".join(f"{d['name']} {d['state']}" for d in dns) or "no <service>.<host> sites yet") + ")")
+    print(f"relay: port {cfg['relay_port']}, bind={' '.join(cfg['bind']) or 'all'}, "
+          f"trusts {' '.join(cfg['relay_trust']) or 'nobody (PROXY_RELAY_TRUST is not set)'}")
     print("caddy: running" if running() else "caddy: NOT running (see workstation-proxy logs)")
     if report:
-        print(f"sites: {len(report['sites'])} site files, {len(report['static'])} static, "
-              f"{len(report.get('tcp', []))} tcp forwards, {len(report['skipped'])} skipped")
-        if report["degraded"]:
-            print("DEGRADED: site files and tcp forwards are disabled because the configuration is invalid")
-        status, now, counts = load_status(), time.time(), {}
-        for key, item in check_targets(report):
-            state, _ = check_state(item, status.get("checks", {}).get(key), cfg["check_interval"], now)
-            counts[state] = counts.get(state, 0) + 1
-        if counts:
-            print("checks: " + ", ".join(f"{counts[s]} {s}" for s in ("up", "down", "unsure", "checking", "none")
-                                         if s in counts) + " (details: workstation-proxy checks)")
+        print(f"www: {len(report['static'])} served, {len(report['skipped'])} skipped (details: workstation-proxy sites)")
     if ERROR.exists():
         print("last error:\n" + ERROR.read_text().strip())
     return 0 if running() else 1
@@ -1111,53 +315,12 @@ def cmd_logs(args):
     return 0
 
 
-def cmd_checks(args):
-    require_enabled()
-    cfg, report = settings(), load_report()
-    if not report:
-        print("no configuration yet: run workstation-proxy reload")
-        return 1
-    quiet = "--quiet" in args
-    STATE.mkdir(parents=True, exist_ok=True)
-    with open(CHECK_LOCK, "w") as lock:
-        try:
-            # One run at a time; a second caller just reads the last results.
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if not quiet:
-                print("a check run is already in progress; showing the last results")
-        else:
-            run_due_checks(cfg, report)
-            refresh_dns(cfg)
-    if quiet:
-        return 0
-    status, now = load_status(), time.time()
-    for key, item in check_targets(report):
-        record = status.get("checks", {}).get(key)
-        state, note = check_state(item, record, cfg["check_interval"], now)
-        age = f" ({int(now - record['checked'])}s ago)" if record and state != "none" else ""
-        print(f"{state:9} {item['kind']:7} {item['name']:22} {note}{age}")
-    return 0
-
-
 def cmd_show(_):
     require_enabled()
-    cfg = settings()
     STATE.mkdir(parents=True, exist_ok=True)
-    build(CANDIDATE, cfg)
+    build(CANDIDATE, settings())
     print((CANDIDATE / "Caddyfile").read_text(), end="")
     shutil.rmtree(CANDIDATE, ignore_errors=True)
-    return 0
-
-
-def cmd_ca(_):
-    require_enabled()
-    cfg = settings()
-    if not cfg["lan"]:
-        print("no internal CA in use (PROXY_LAN_DOMAIN is not set)")
-        return 0
-    print(f"download: https://sites.{cfg['public']}/root.crt" if cfg["public"] else f"download: http://sites.{cfg['lan']}/root.crt")
-    print(f"file: {CA_ROOT}" + ("" if CA_ROOT.exists() else " (created when Caddy first starts)"))
     return 0
 
 
@@ -1165,17 +328,17 @@ def cmd_run(_):
     require_enabled()
     cfg = settings()
     report_problems(cfg)
-    ok, message = prepare(cfg, strict=False)
-    if message:
-        print(f"workstation-proxy: WARNING: {message}", file=sys.stderr, flush=True)
+    for name in ("status.json", "dns.json", "checks.lock"):  # left by the old built-in proxy
+        (STATE / name).unlink(missing_ok=True)
+    ok, message = prepare(cfg)
     if not ok:
-        print("workstation-proxy: no valid configuration; not starting Caddy", file=sys.stderr, flush=True)
+        print("workstation-proxy: no valid configuration; not starting Caddy:\n" + message, file=sys.stderr, flush=True)
         return 1
-    os.execvpe("caddy", ["caddy", "run", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile"], caddy_env())
+    os.execvp("caddy", ["caddy", "run", "--config", str(ACTIVE / "Caddyfile"), "--adapter", "caddyfile"])
 
 
-COMMANDS = {"check": cmd_check, "show": cmd_show, "reload": cmd_reload, "sites": cmd_sites, "status": cmd_status,
-            "logs": cmd_logs, "ca": cmd_ca, "checks": cmd_checks, "run": cmd_run}
+COMMANDS = {"status": cmd_status, "sites": cmd_sites, "reload": cmd_reload, "show": cmd_show,
+            "logs": cmd_logs, "run": cmd_run}
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
