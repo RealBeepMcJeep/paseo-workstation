@@ -8,9 +8,15 @@
 set -euo pipefail
 
 version() {
-  local label="$1" out
+  # A tool that fails prints its output and exit code before the build stops, so
+  # the CI log shows why (set -e would otherwise stop here silently).
+  local label="$1" out status=0
   shift
-  out="$("$@" 2>&1)"
+  out="$("$@" 2>&1)" || status=$?
+  if [ "$status" -ne 0 ]; then
+    printf '%-22s FAILED (exit %s): %s\n%s\n' "$label" "$status" "$*" "${out:-(no output)}" >&2
+    exit 1
+  fi
   printf '%-22s %s\n' "$label" "${out%%$'\n'*}"
 }
 require() { grep -E "$1" <<< "$2" > /dev/null || { echo "missing: $3" >&2; exit 1; }; }
