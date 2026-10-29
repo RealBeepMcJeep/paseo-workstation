@@ -169,6 +169,10 @@ only from the stack's environment (`.env`) at runtime: `PASEO_PASSWORD`, `GITEA_
 - New upstream binary or npm package: add an `ARG`, install it with that exact
   version, and add an `emit` line to `scripts/probe-versions.sh`, so the probe
   notices new releases.
+- Everything is installed as root but runs as user 568: end each install with
+  `chmod -R a+rX` on its directory if the installer may leave files without
+  read/execute for others. `workstation-check` fails the build, naming the file,
+  if any executable in the tool directories can't run as 568.
 - New Claude language server: add a plugin directory under
   `rootfs/opt/claude-plugins/` and append it to `CLAUDE_CODE_PLUGIN_DIRS`.
 

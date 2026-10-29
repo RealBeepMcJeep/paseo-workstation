@@ -84,6 +84,19 @@ version pdftotext       pdftotext -v
 version tmux            tmux -V
 version tini            tini --version
 
+# Tools are installed as root and run as this user: every command in the image's
+# tool directories (following symlinks, as the shell does) must be runnable here,
+# including ones without a version line above. ilspycmd 11.2's command was a
+# symlink to a binary without execute for others. A broken symlink fails too.
+blocked="$(find -L /opt/dotnet-tools /opt/cargo/bin /usr/local/bin "$(npm prefix -g)/bin" /opt/dotnet/dotnet \
+  -maxdepth 1 \( -type l -o -type f ! -executable \) -print 2> /dev/null || true)"
+if [ -n "$blocked" ]; then
+  printf 'commands not runnable by %s (installed without execute for others, or a broken link):\n%s\n' \
+    "$(id -un)" "$blocked" >&2
+  exit 1
+fi
+printf '%-22s %s\n' "permissions" "every image command runnable by $(id -un)"
+
 # Image-owned Claude LSP plugins must pass strict validation.
 for plugin in /opt/claude-plugins/*/; do
   claude plugin validate --strict "$plugin" > /dev/null
