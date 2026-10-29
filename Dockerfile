@@ -100,7 +100,9 @@ RUN : "${RUST_STABLE:?}" \
 # .NET: SDK 8 for net8.0 mods/tests plus the current LTS SDK, which also runs
 # csharp-ls and ilspycmd, both at exactly the versions the probe found (oldest
 # first). SDK-style net48/net472/net40 targets build through reference-assembly
-# packages restored from NuGet.
+# packages restored from NuGet. Tools install as root and run as 568, so the trees
+# end world-readable and -runnable: some tool packages ship native binaries without
+# execute for others (ilspycmd 11.2: rwxr-----, "Permission denied" for 568).
 ARG DOTNET8_SDK
 ARG DOTNET_LTS_CHANNEL
 ARG DOTNET_LTS_SDK
@@ -114,6 +116,7 @@ RUN : "${DOTNET8_SDK:?}" "${DOTNET_LTS_SDK:?}" \
     && export DOTNET_CLI_HOME=/tmp/dotnet-home NUGET_PACKAGES=/tmp/nuget \
     && /opt/dotnet/dotnet tool install --tool-path /opt/dotnet-tools csharp-ls ${CSHARP_LS_VERSION:+--version "$CSHARP_LS_VERSION"} \
     && /opt/dotnet/dotnet tool install --tool-path /opt/dotnet-tools ilspycmd ${ILSPYCMD_VERSION:+--version "$ILSPYCMD_VERSION"} \
+    && chmod -R a+rX /opt/dotnet /opt/dotnet-tools \
     && rm -rf dotnet-install.sh /tmp/dotnet-home /tmp/nuget
 
 # Single-binary tools from upstream releases, at the probe's exact versions. Every
