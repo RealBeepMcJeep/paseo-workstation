@@ -1,0 +1,166 @@
+#!/bin/bash
+# workstation-view: take over a bladebro browser from your own web browser (noVNC).
+#
+# bladebro draws each browser on its own virtual screen (Xvfb :99, :100, ...). This
+# command shows one of them over VNC in a web page: x11vnc on the screen, noVNC as
+# the page, and a private Caddy that serves the page and passes /websockify to
+# x11vnc. Everything listens on 127.0.0.1 only; publish WORKSTATION_VIEW_PORT through
+# a proxy (e.g. hq-caddy `import relay <name> <port>`) to reach it from elsewhere.
+#
+# It runs only while you use it: a fresh 8-character password each time, and it
+# stops after WORKSTATION_VIEW_MINUTES, when the screen goes away, or on Ctrl-C.
+# Closing the viewer never closes the browser, and vice versa.
+#
+# Usage:
+#   workstation-view              show the only open browser (lists them if several)
+#   workstation-view list         list open bladebro browsers
+#   workstation-view :99          show that screen
+#   workstation-view new          open a browser first (bladebro CLI), then show it
+#
+# Settings: WORKSTATION_VIEW_PORT (6080), WORKSTATION_VIEW_URL (the address you
+# published it under, for the printed link), WORKSTATION_VIEW_MINUTES (30).
+set -euo pipefail
+
+port="${WORKSTATION_VIEW_PORT:-6080}"
+minutes="${WORKSTATION_VIEW_MINUTES:-30}"
+novnc="${WORKSTATION_VIEW_NOVNC:-/opt/novnc}"
+url="${WORKSTATION_VIEW_URL:-http://127.0.0.1:$port/}"
+
+say() { printf 'workstation-view: %s\n' "$*" >&2; }
+die() { say "$*"; exit 1; }
+
+# One line per virtual screen: "<display> <xvfb pid> <auth file or ->".
+screens() {
+  local pid args display auth
+  while read -r pid args; do
+    display="$(grep -o -E '(^| ):[0-9]+( |$)' <<< "$args" | head -n 1 | tr -d ' ')" || true
+    [ -n "$display" ] || continue
+    auth="$(grep -o -E -- '-auth [^ ]+' <<< "$args" | cut -d' ' -f2)" || true
+    printf '%s %s %s\n' "$display" "$pid" "${auth:--}"
+  done < <(ps -eo pid=,args= | awk '$2 ~ /(^|\/)Xvfb$/ { $2 = ""; print }')
+}
+
+# The page a screen's browser shows ("title | url"), via its debug port if it has one.
+page_on() {
+  local pid args debug
+  for pid in $(pgrep -x chromium 2> /dev/null || true); do
+    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)" || continue
+    case "$args" in *--type=*) continue ;; esac
+    tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null | grep -qx "DISPLAY=$1" || continue
+    debug="$(grep -o -E -- '--remote-debugging-port=[0-9]+' <<< "$args" | cut -d= -f2)" || true
+    if [ -n "$debug" ] && [ "$debug" != 0 ]; then
+      curl -fsS -m 3 "http://127.0.0.1:$debug/json/list" 2> /dev/null \
+        | jq -r '[.[] | select(.type == "page")][0] | "\(.title[0:50]) | \(.url[0:90])"' 2> /dev/null && return
+    fi
+    echo "(browser open)"
+    return
+  done
+  echo "(no browser on this screen)"
+}
+
+list() {
+  local found=0 display pid auth
+  while read -r display pid auth; do
+    found=1
+    printf '%-6s %s\n' "$display" "$(page_on "$display")"
+  done < <(screens)
+  [ "$found" = 1 ] || echo "no bladebro browser is open (workstation-view new opens one)"
+}
+
+choice="${1:-}"
+case "$choice" in
+  -h | --help | help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  list) list; exit 0 ;;
+  new)
+    before="$(screens | cut -d' ' -f1 | sort)"
+    say "opening a browser (bladebro CLI)…"
+    bladebro nav about:blank > /dev/null || die "bladebro could not open a browser"
+    for _ in $(seq 1 30); do
+      choice="$(comm -13 <(echo "$before") <(screens | cut -d' ' -f1 | sort) | head -n 1)"
+      [ -n "$choice" ] && break
+      sleep 1
+    done
+    [ -n "$choice" ] || die "the new browser has no virtual screen (is Xvfb installed?)"
+    ;;
+  "")
+    mapfile -t all < <(screens)
+    case "${#all[@]}" in
+      0) die "no bladebro browser is open. Ask the agent to open the page, or: workstation-view new" ;;
+      1) choice="${all[0]%% *}" ;;
+      *) list; die "several browsers are open: name one, e.g. workstation-view ${all[0]%% *}" ;;
+    esac
+    ;;
+  :[0-9]*) ;;
+  *) die "unknown argument: $choice (see workstation-view --help)" ;;
+esac
+
+line="$(screens | awk -v d="$choice" '$1 == d' | head -n 1)"
+[ -n "$line" ] || die "no virtual screen $choice (see: workstation-view list)"
+read -r display xvfb auth <<< "$line"
+rfb=$((5900 + ${display#:}))
+if (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null; then
+  die "port $port is in use: another viewer is probably running (stop it first)"
+fi
+command -v x11vnc > /dev/null || die "x11vnc is not installed"
+[ -f "$novnc/vnc.html" ] || die "noVNC not found in $novnc"
+
+work="$(mktemp -d)"
+x11vnc_pid=""
+caddy_pid=""
+cleanup() {
+  [ -n "$caddy_pid" ] && kill "$caddy_pid" 2> /dev/null
+  [ -n "$x11vnc_pid" ] && kill "$x11vnc_pid" 2> /dev/null
+  wait 2> /dev/null
+  rm -rf "${work:?}"
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+password="$(python3 -c 'import secrets, string; print("".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8)))')"
+x11vnc -storepasswd "$password" "$work/passwd" > /dev/null 2>&1 || die "could not store the VNC password"
+auth_args=()
+[ "$auth" != "-" ] && auth_args=(-auth "$auth")
+x11vnc -display "$display" "${auth_args[@]}" -localhost -rfbport "$rfb" -rfbauth "$work/passwd" \
+  -shared -forever -noxdamage -quiet -o "$work/x11vnc.log" > /dev/null 2>&1 &
+x11vnc_pid=$!
+
+cat > "$work/Caddyfile" << EOF
+{
+	admin off
+	auto_https off
+	persist_config off
+}
+http://127.0.0.1:$port {
+	bind 127.0.0.1
+	@socket path /websockify
+	reverse_proxy @socket 127.0.0.1:$rfb
+	@start path /
+	redir @start /vnc.html?autoconnect=1&resize=scale&path=websockify 302
+	root * "$novnc"
+	file_server
+}
+EOF
+XDG_DATA_HOME="$work" XDG_CONFIG_HOME="$work" caddy run --adapter caddyfile --config "$work/Caddyfile" \
+  > "$work/caddy.log" 2>&1 &
+caddy_pid=$!
+
+for _ in $(seq 1 50); do
+  (echo > "/dev/tcp/127.0.0.1/$rfb") 2> /dev/null && (echo > "/dev/tcp/127.0.0.1/$port") 2> /dev/null && break
+  kill -0 "$x11vnc_pid" 2> /dev/null || die "x11vnc stopped: $(tail -n 3 "$work/x11vnc.log")"
+  kill -0 "$caddy_pid" 2> /dev/null || die "the web front stopped: $(tail -n 3 "$work/caddy.log")"
+  sleep 0.2
+done
+
+stop_at=$((SECONDS + minutes * 60))
+printf '\nBrowser on %s: %s\n' "$display" "$(page_on "$display")"
+printf 'Open:     %s\nPassword: %s\n' "$url" "$password"
+printf 'Stops at %s, when that browser closes, or on Ctrl-C. The browser stays open either way.\n\n' \
+  "$(date -d "+$minutes min" +%H:%M)"
+
+while [ "$SECONDS" -lt "$stop_at" ]; do
+  kill -0 "$xvfb" 2> /dev/null || { say "the browser's screen closed; stopping"; exit 0; }
+  kill -0 "$x11vnc_pid" 2> /dev/null || { say "x11vnc stopped; stopping"; exit 0; }
+  kill -0 "$caddy_pid" 2> /dev/null || { say "the web front stopped; stopping"; exit 0; }
+  sleep 2
+done
+say "time is up ($minutes min); stopping"

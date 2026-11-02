@@ -41,6 +41,8 @@ services:
       MCPHUB_TOKEN: ${MCPHUB_KEY:-}
       # Behind the subdomain proxy, also set PASEO_HOSTNAMES: paseo.example.com
       # (unset or empty means Paseo's default host check).
+      # Where workstation-view is published (e.g. https://view.example.com/), for its printed link.
+      WORKSTATION_VIEW_URL: ${WORKSTATION_VIEW_URL:-}
       # Relay for the subdomain proxy on another box (see README): off unless a port is set.
       PROXY_RELAY_PORT: ${PROXY_RELAY_PORT:-}
       PROXY_RELAY_TRUST: ${PROXY_RELAY_TRUST:-}

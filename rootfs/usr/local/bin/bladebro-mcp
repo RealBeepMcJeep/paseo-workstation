@@ -5,4 +5,5 @@
 export CHROME_PATH="${CHROME_PATH:-/usr/bin/chromium}"
 export BLADE_CHROME_FLAGS="${BLADE_CHROME_FLAGS:---no-sandbox}"
 export BLADE_NO_UPDATE_CHECK=1
+export BLADE_IDLE_TIMEOUT="${BLADE_IDLE_TIMEOUT:-1800}"
 exec /usr/local/bin/bladebro mcp "$@"
