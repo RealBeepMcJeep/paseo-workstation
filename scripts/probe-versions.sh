@@ -76,6 +76,13 @@ gh=$(github_release cli/cli)
 gh_version=$(jq -er .tag_name <<<"$gh")
 emit GH_VERSION "$gh_version"
 emit GH_SHA256 "$(asset_sha256 "$gh" "gh_${gh_version#v}_linux_amd64.tar.gz")"
+# noVNC (workstation-view's web client) publishes no release assets: hash the tag's
+# source archive (assigned first, so a failed download stops the probe).
+novnc_version=$(github_latest novnc/noVNC)
+novnc_sha256=$(curl -fsSL --retry 3 "https://github.com/novnc/noVNC/archive/refs/tags/$novnc_version.tar.gz" \
+  | sha256sum | cut -d' ' -f1 | grep -E '^[0-9a-f]{64}$')
+emit NOVNC_VERSION "$novnc_version"
+emit NOVNC_SHA256 "$novnc_sha256"
 emit TEA_VERSION "$(curl -fsSL https://gitea.com/api/v1/repos/gitea/tea/releases/latest | jq -er .tag_name)"
 emit CADDY_VERSION "$(github_latest caddyserver/caddy)"
 emit XCADDY_VERSION "$(github_latest caddyserver/xcaddy)"

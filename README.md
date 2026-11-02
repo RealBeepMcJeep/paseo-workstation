@@ -135,6 +135,29 @@ within a minute; dotfiles are never served. `workstation-proxy status` and
 Earlier images ran the whole proxy here (`PROXY_DOMAIN`, `PROXY_LAN_DOMAIN`, Cloudflare
 DNS, TCP forwards, a sites page). Those settings are now ignored with a warning.
 
+## Taking over a bladebro browser (`workstation-view`)
+
+When an agent's browser needs a person (a login, a captcha), run `workstation-view`
+in the container. It shows that browser in your own web browser through noVNC:
+
+```sh
+workstation-view list        # open bladebro browsers and their pages
+workstation-view             # show the only one (or name it: workstation-view :99)
+workstation-view new         # open a browser first, e.g. to log in for the agents
+```
+
+It prints a link and a fresh 8-character password, and stops after 30 minutes
+(`WORKSTATION_VIEW_MINUTES`), when that browser closes, or on Ctrl-C. Closing the
+viewer never closes the browser. Everything listens on `127.0.0.1` only: x11vnc on the
+browser's virtual screen, and a private Caddy on `WORKSTATION_VIEW_PORT` (default 6080)
+that serves noVNC and passes `/websockify` to x11vnc. To use it from another machine,
+publish that port through your proxy (hq-caddy: `import relay <name> 6080`) and set
+`WORKSTATION_VIEW_URL` to that address, so the printed link is right.
+
+bladebro closes an idle browser after `BLADE_IDLE_TIMEOUT` (the image sets 1800 s), so
+there's time to take over. A login made in an agent's own browser stays in that
+browser; to share it with other agents, the agent saves it (`state save <name>`).
+
 ## Checking a deployment
 
 ```sh

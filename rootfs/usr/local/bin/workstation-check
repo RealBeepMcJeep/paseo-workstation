@@ -83,6 +83,9 @@ version ffmpeg          ffmpeg -version
 version pdftotext       pdftotext -v
 version tmux            tmux -V
 version tini            tini --version
+version x11vnc          x11vnc -version
+version novnc           jq -r .version /opt/novnc/package.json
+workstation-view --help > /dev/null
 
 # Tools are installed as root and run as this user: every command in the image's
 # tool directories (following symlinks, as the shell does) must be runnable here,

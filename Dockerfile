@@ -30,7 +30,8 @@ USER 0
 WORKDIR /tmp
 
 # System packages. chromium/xvfb/xauth/fonts: headless browsing for bladebro
-# and projects. ffmpeg: media work (yoto-mcp). libicu76: .NET globalization.
+# and projects; x11vnc: workstation-view (take over a bladebro browser). ffmpeg:
+# media work (yoto-mcp). libicu76: .NET globalization.
 # DEBIAN_REFRESH is the ISO week from the probe: it changes weekly, so Debian
 # security updates are picked up at least once a week.
 ARG DEBIAN_REFRESH
@@ -46,7 +47,7 @@ RUN echo "Debian refresh: ${DEBIAN_REFRESH:-unset}" \
          build-essential cmake pkg-config \
          python3 python3-venv python3-tomlkit \
          libicu76 \
-         chromium xvfb xauth fonts-liberation fonts-noto-color-emoji \
+         chromium xvfb xauth x11vnc fonts-liberation fonts-noto-color-emoji \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -133,8 +134,11 @@ ARG YQ_SHA256
 ARG GH_VERSION
 ARG GH_SHA256
 ARG TEA_VERSION
+ARG NOVNC_VERSION
+ARG NOVNC_SHA256
 RUN : "${UV_VERSION:?}" "${RUFF_VERSION:?}" "${MARKSMAN_VERSION:?}" "${MARKSMAN_SHA256:?}" \
       "${YQ_VERSION:?}" "${YQ_SHA256:?}" "${GH_VERSION:?}" "${GH_SHA256:?}" "${TEA_VERSION:?}" \
+      "${NOVNC_VERSION:?}" "${NOVNC_SHA256:?}" \
     && gh_release() { echo "https://github.com/$1/releases/download/$2/$3"; } \
     && fetch_verified() { curl -fsSLO "$(gh_release "$@")" && curl -fsSLO "$(gh_release "$1" "$2" "$3.sha256")" && sha256sum -c "$3.sha256"; } \
     && verify() { echo "$1  $2" | sha256sum -c; } \
@@ -159,6 +163,12 @@ RUN : "${UV_VERSION:?}" "${RUFF_VERSION:?}" "${MARKSMAN_VERSION:?}" "${MARKSMAN_
     && curl -fsSLO "https://dl.gitea.com/tea/${TEA_VERSION#v}/$tea_file.sha256" \
     && sha256sum -c "$tea_file.sha256" \
     && install -m 755 "$tea_file" /usr/local/bin/tea \
+    && curl -fsSL -o novnc.tar.gz "https://github.com/novnc/noVNC/archive/refs/tags/$NOVNC_VERSION.tar.gz" \
+    && verify "$NOVNC_SHA256" novnc.tar.gz \
+    && mkdir -p /opt/novnc \
+    && tar -xzf novnc.tar.gz --strip-components=1 -C /opt/novnc \
+    && rm -rf /opt/novnc/.github /opt/novnc/docs /opt/novnc/snap /opt/novnc/tests /opt/novnc/utils \
+    && chmod -R a+rX /opt/novnc \
     && rm -f ./*.tar.gz ./*.sha256 marksman yq "$tea_file"
 
 # npm language servers. typescript@6 stays on major 6: TypeScript 7 (the Go
@@ -209,13 +219,15 @@ COPY rootfs/ /
 RUN chmod 755 /usr/local/bin/workstation-* /usr/local/bin/bladebro-mcp /usr/local/bin/caddy
 
 # Updates come from new images, not in-app updaters. CHROME_PATH and
-# BLADE_* configure bladebro for the image's Chromium; --no-sandbox because
+# BLADE_* configure bladebro for the image's Chromium (an idle browser stays 30
+# minutes, so a person taking over with workstation-view has time); --no-sandbox because
 # Chromium's own sandbox cannot start under no-new-privileges and the default
 # seccomp profile (the container is the boundary).
 ENV CLAUDE_CODE_PLUGIN_DIRS=/opt/claude-plugins/pyright-lsp:/opt/claude-plugins/csharp-lsp:/opt/claude-plugins/rust-analyzer-lsp:/opt/claude-plugins/typescript-lsp:/opt/claude-plugins/marksman-lsp:/opt/claude-plugins/yaml-lsp \
     DISABLE_AUTOUPDATER=1 \
     PI_SKIP_VERSION_CHECK=1 \
     BLADE_NO_UPDATE_CHECK=1 \
+    BLADE_IDLE_TIMEOUT=1800 \
     BLADE_CHROME_FLAGS=--no-sandbox \
     CHROME_PATH=/usr/bin/chromium
 
