@@ -8,8 +8,8 @@
 # a proxy (e.g. hq-caddy `import relay <name> <port>`) to reach it from elsewhere.
 #
 # It runs only while you use it: a fresh 8-character password each time, and it
-# stops after WORKSTATION_VIEW_MINUTES, when the screen goes away, or on Ctrl-C.
-# Closing the viewer never closes the browser, and vice versa.
+# stops after WORKSTATION_VIEW_MINUTES, when the browser closes (bladebro may keep
+# its empty screen), or on Ctrl-C. Closing the viewer never closes the browser.
 #
 # Usage:
 #   workstation-view              show the only open browser (lists them if several)
@@ -38,6 +38,17 @@ screens() {
     auth="$(grep -o -E -- '-auth [^ ]+' <<< "$args" | cut -d' ' -f2)" || true
     printf '%s %s %s\n' "$display" "$pid" "${auth:--}"
   done < <(ps -eo pid=,args= | awk '$2 ~ /(^|\/)Xvfb$/ { $2 = ""; print }')
+}
+
+# PIDs of the browsers (Chromium main processes) drawing on a screen.
+browsers_on() {
+  local pid args
+  for pid in $(pgrep -x chromium 2> /dev/null || true); do
+    args="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)" || continue
+    case "$args" in *--type=*) continue ;; esac
+    tr '\0' '\n' < "/proc/$pid/environ" 2> /dev/null | grep -qx "DISPLAY=$1" && echo "$pid"
+  done
+  return 0
 }
 
 # The page a screen's browser shows ("title | url"), via its debug port if it has one.
@@ -130,7 +141,9 @@ cat > "$work/Caddyfile" << EOF
 	auto_https off
 	persist_config off
 }
-http://127.0.0.1:$port {
+# Any Host: behind a proxy, requests keep the public name (e.g. view.example.com).
+# Still reachable on 127.0.0.1 only (bind).
+http://:$port {
 	bind 127.0.0.1
 	@socket path /websockify
 	reverse_proxy @socket 127.0.0.1:$rfb
@@ -154,11 +167,22 @@ done
 stop_at=$((SECONDS + minutes * 60))
 printf '\nBrowser on %s: %s\n' "$display" "$(page_on "$display")"
 printf 'Open:     %s\nPassword: %s\n' "$url" "$password"
-printf 'Stops at %s, when that browser closes, or on Ctrl-C. The browser stays open either way.\n\n' \
+printf 'Stops at %s, when that browser closes, or on Ctrl-C. Stopping the viewer never closes the browser.\n\n' \
   "$(date -d "+$minutes min" +%H:%M)"
 
+# Once a browser has been seen on the screen, stop a few seconds after the last one is gone:
+# bladebro may keep the empty screen, and a black screen helps nobody.
+seen=0
+gone=0
 while [ "$SECONDS" -lt "$stop_at" ]; do
   kill -0 "$xvfb" 2> /dev/null || { say "the browser's screen closed; stopping"; exit 0; }
+  if [ -n "$(browsers_on "$display")" ]; then
+    seen=1
+    gone=0
+  elif [ "$seen" = 1 ]; then
+    gone=$((gone + 1))
+    [ "$gone" -ge 3 ] && { say "the browser closed; stopping"; exit 0; }
+  fi
   kill -0 "$x11vnc_pid" 2> /dev/null || { say "x11vnc stopped; stopping"; exit 0; }
   kill -0 "$caddy_pid" 2> /dev/null || { say "the web front stopped; stopping"; exit 0; }
   sleep 2

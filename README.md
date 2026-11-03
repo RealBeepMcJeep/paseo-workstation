@@ -147,8 +147,9 @@ workstation-view new         # open a browser first, e.g. to log in for the agen
 ```
 
 It prints a link and a fresh 8-character password, and stops after 30 minutes
-(`WORKSTATION_VIEW_MINUTES`), when that browser closes, or on Ctrl-C. Closing the
-viewer never closes the browser. Everything listens on `127.0.0.1` only: x11vnc on the
+(`WORKSTATION_VIEW_MINUTES`), a few seconds after that browser closes (even though
+bladebro may keep its empty screen), or on Ctrl-C. Closing the viewer never closes
+the browser. Everything listens on `127.0.0.1` only: x11vnc on the
 browser's virtual screen, and a private Caddy on `WORKSTATION_VIEW_PORT` (default 6080)
 that serves noVNC and passes `/websockify` to x11vnc. To use it from another machine,
 publish that port through your proxy (hq-caddy: `import relay <name> 6080`) and set
