@@ -281,11 +281,16 @@ jobs:
           for _ in $(seq 1 30); do docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html && break; sleep 1; done
           docker exec smoke cat /tmp/view.out
           docker exec smoke grep -qE '^Password: [A-Za-z0-9]{8}$' /tmp/view.out || { echo "::error::workstation-view printed no password"; exit 1; }
-          [ "$(docker exec smoke curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:6080/)" = 302 ] \
-            || { echo "::error::workstation-view did not redirect to noVNC"; exit 1; }
+          # Behind a proxy the Host header is the public name: both must work.
+          for view_host in 127.0.0.1:6080 view.example.test; do
+            [ "$(docker exec smoke curl -s -o /dev/null -w '%{http_code}' -H "Host: $view_host" http://127.0.0.1:6080/)" = 302 ] \
+              || { echo "::error::workstation-view did not redirect to noVNC for Host $view_host"; exit 1; }
+            docker exec smoke curl -fsS -H "Host: $view_host" http://127.0.0.1:6080/vnc.html | grep -q '<title>noVNC' \
+              || { echo "::error::workstation-view did not serve noVNC for Host $view_host"; exit 1; }
+          done
           view_ws="$(docker exec smoke curl --http1.1 -s -m 3 -o - -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
             -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' -H 'Sec-WebSocket-Protocol: binary' \
-            -H 'Origin: http://127.0.0.1:6080' http://127.0.0.1:6080/websockify | tr -dc '[:print:]' || true)"
+            -H 'Host: view.example.test' -H 'Origin: https://view.example.test' http://127.0.0.1:6080/websockify | tr -dc '[:print:]' || true)"
           grep -q 'RFB 003' <<< "$view_ws" || { echo "::error::workstation-view WebSocket did not reach x11vnc"; exit 1; }
           smoke_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' smoke)"
           [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$smoke_ip:6080/")" = 000 ] \

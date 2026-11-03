@@ -130,7 +130,9 @@ cat > "$work/Caddyfile" << EOF
 	auto_https off
 	persist_config off
 }
-http://127.0.0.1:$port {
+# Any Host: behind a proxy, requests keep the public name (e.g. view.example.com).
+# Still reachable on 127.0.0.1 only (bind).
+http://:$port {
 	bind 127.0.0.1
 	@socket path /websockify
 	reverse_proxy @socket 127.0.0.1:$rfb
