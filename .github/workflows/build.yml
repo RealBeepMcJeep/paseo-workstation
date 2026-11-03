@@ -271,7 +271,8 @@ jobs:
           [ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Hq-Relay-Port: 18999' "http://$smoke_ip:18890/marker.txt")" = 403 ] \
             || { echo "::error::relay answered an untrusted source"; exit 1; }
           # workstation-view: a browser on its own virtual screen, shown through noVNC.
-          # The WebSocket path must reach x11vnc (RFB greeting); closing the screen stops the viewer.
+          # The WebSocket path must reach x11vnc (RFB greeting); closing the browser stops the viewer,
+          # even though its (bladebro-style) screen stays.
           docker exec -d smoke sh -c 'Xvfb :50 -screen 0 1280x800x24 -nolisten tcp > /tmp/xvfb50.log 2>&1'
           sleep 2
           docker exec -d smoke sh -c 'DISPLAY=:50 chromium --no-sandbox --disable-gpu --user-data-dir=/tmp/view-profile --no-first-run about:blank > /tmp/chromium50.log 2>&1'
@@ -295,11 +296,13 @@ jobs:
           smoke_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' smoke)"
           [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$smoke_ip:6080/")" = 000 ] \
             || { echo "::error::workstation-view listens beyond 127.0.0.1"; exit 1; }
-          docker exec smoke pkill -x Xvfb
-          for _ in $(seq 1 15); do docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html 2> /dev/null || break; sleep 1; done
+          docker exec smoke pkill -x chromium
+          for _ in $(seq 1 20); do docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html 2> /dev/null || break; sleep 1; done
           if docker exec smoke curl -fsS -o /dev/null http://127.0.0.1:6080/vnc.html 2> /dev/null; then
-            echo "::error::workstation-view kept running after its screen closed"; exit 1
+            echo "::error::workstation-view kept running after its browser closed"; exit 1
           fi
+          docker exec smoke grep -q 'the browser closed' /tmp/view.err || { echo "::error::workstation-view stopped for another reason"; exit 1; }
+          docker exec smoke pkill -x Xvfb || true
           docker exec smoke cat /tmp/view.err
           # Retired proxy settings only warn.
           docker exec -e PROXY_DOMAIN=example.com smoke workstation-proxy status | grep -F 'PROXY_DOMAIN no longer used'
